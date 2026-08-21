@@ -1,0 +1,83 @@
+{
+  "_comment": "termx agent-status hooks. Merge these into ~/.codebuddy/settings.json (user-level) or <project>/.codebuddy/settings.json. Replace /ABS/PATH/TO with the real path to report-status.sh. Set TERMX_PORT if your termx server is not on 7681. After editing, run /hooks inside CodeBuddy to activate.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh idle",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh running",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh running",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh waiting",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh idle",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

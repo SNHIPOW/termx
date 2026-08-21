@@ -1,11 +1,21 @@
 #!/usr/bin/env bun
 import { join } from "path";
+import { homedir } from "os";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import { parseArgs } from "util";
 import { spawn } from "bun";
 import { sendCommand, type PtyHandle } from "./pty";
+import {
+  setStatus,
+  getStatus,
+  getAllStatus,
+  clearStatus,
+  renameStatus,
+  subscribe,
+  isStatus,
+} from "./status";
 
 const tmuxCheck = spawn(["which", "tmux"]);
 if ((await tmuxCheck.exited) !== 0) {
@@ -27,7 +37,9 @@ const { values } = parseArgs({
 
 const DEFAULT_THEME = (values.theme as string) || "Dark";
 
-const SESSION_CWD = process.cwd();
+// New tmux sessions start in the user's home directory by default.
+// Override with TERMX_CWD if you want a different starting path.
+const SESSION_CWD = process.env.TERMX_CWD || homedir() || process.cwd();
 const parsedPort = parseInt((values.port as string) || process.env.PORT || "7681", 10);
 const PORT = Number.isNaN(parsedPort) ? 7681 : parsedPort;
 
@@ -40,7 +52,11 @@ app.get("/config", (c) => c.json({ theme: DEFAULT_THEME }));
 
 app.get("/sessions", async (c) => {
   const sessions = await sendCommand({ action: "list" });
-  return c.json(sessions);
+  const withStatus = sessions.map((s) => {
+    const st = getStatus(s.name);
+    return { ...s, status: st?.status ?? "idle", statusMessage: st?.message ?? "" };
+  });
+  return c.json(withStatus);
 });
 
 app.post("/sessions", async (c) => {
@@ -58,6 +74,7 @@ app.delete("/sessions/:name", async (c) => {
     return c.json({ success: false, error: "Cannot delete default session" }, 400);
   }
   if (await sendCommand({ action: "kill", name })) {
+    clearStatus(name);
     return c.json({ success: true });
   }
   return c.json({ success: false, error: "Session not found" }, 404);
@@ -74,6 +91,7 @@ app.patch("/sessions/:name", async (c) => {
     return c.json({ success: false, error: "Cannot rename default session" }, 400);
   }
   if (await sendCommand({ action: "rename", oldName, newName })) {
+    renameStatus(oldName, newName);
     return c.json({ success: true, name: newName });
   }
   return c.json({ success: false, error: "Rename failed - session not found or name taken" }, 400);
@@ -90,6 +108,50 @@ app.post("/exec/:session", async (c) => {
     return c.json({ success: true });
   }
   return c.json({ success: false, error: "Session not found" }, 404);
+});
+
+// Agent status reporting (called by CodeBuddy hook scripts).
+app.post("/hook/:session", async (c) => {
+  const session = c.req.param("session");
+  const body = await c.req.json().catch(() => ({}));
+  if (!isStatus(body.status)) {
+    return c.json({ ok: false, error: "Invalid status" }, 400);
+  }
+  const message = typeof body.message === "string" ? body.message.slice(0, 500) : "";
+  setStatus(session, body.status, message);
+  return c.json({ ok: true });
+});
+
+// Server-Sent Events: push status changes to the browser.
+app.get("/events", (c) => {
+  const stream = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      const send = (payload: string) => {
+        try {
+          controller.enqueue(enc.encode(payload));
+        } catch {}
+      };
+      // Initial full snapshot.
+      send(`data: ${JSON.stringify({ type: "snapshot", statuses: getAllStatus() })}\n\n`);
+      const unsub = subscribe(send);
+      const ping = setInterval(() => send(`: ping\n\n`), 30000);
+      c.req.raw.signal.addEventListener("abort", () => {
+        clearInterval(ping);
+        unsub();
+        try {
+          controller.close();
+        } catch {}
+      });
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
 });
 
 type WsData = { session: string; cols: number; rows: number };

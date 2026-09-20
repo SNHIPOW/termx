@@ -16,6 +16,7 @@ import {
   renameStatus,
   subscribe,
   isStatus,
+  broadcast,
 } from "./status";
 
 const tmuxCheck = spawn(["which", "tmux"]);
@@ -323,6 +324,61 @@ app.get("/m/capture/:session", async (c) => {
     return c.json({ ok: false, error: "capture failed" }, 500);
   }
 });
+
+// --- Shared sidebar layout (server-side) -----------------------------------
+// Groups/pins/order used to live in each browser's localStorage, which is
+// per-origin AND per-device: the phone could never see the desktop's groups.
+// The layout is now a small JSON file the server owns, so every device reads
+// and writes the same one. The desktop stays the main editor; the phone only
+// reads. Keys mirror the old localStorage names so migrating is a copy.
+import { writeFileSync, readFileSync } from "fs";
+
+const LAYOUT_FILE = join(homedir(), ".termx-layout.json");
+const LAYOUT_KEYS = [
+  "termx-groups", "termx-session-group", "termx-pinned",
+  "termx-pinned-collapsed", "termx-session-order",
+] as const;
+
+function readLayout(): Record<string, unknown> {
+  try {
+    const d = JSON.parse(readFileSync(LAYOUT_FILE, "utf8"));
+    return typeof d === "object" && d !== null ? d : {};
+  } catch {
+    return {};
+  }
+}
+
+app.get("/layout", (c) => c.json(readLayout()));
+
+// Replacing the whole layout keeps the API dumb (no merge logic to get wrong);
+// the desktop UI is the only writer and it always has the full state at hand.
+// Body: { "termx-groups": "...json string...", ... } — values stay JSON
+// strings so the client code can treat them exactly like localStorage values.
+app.post("/layout", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  if (typeof body !== "object" || body === null) {
+    return c.json({ ok: false, error: "invalid body" }, 400);
+  }
+  const next: Record<string, string> = {};
+  for (const k of LAYOUT_KEYS) {
+    if (typeof body[k] === "string") next[k] = body[k];
+  }
+  if (Object.keys(next).length === 0) {
+    return c.json({ ok: false, error: "no layout keys in body" }, 400);
+  }
+  try {
+    writeFileSync(LAYOUT_FILE, JSON.stringify(next, null, 2));
+    broadcastLayoutChanged();
+    return c.json({ ok: true });
+  } catch {
+    return c.json({ ok: false, error: "write failed" }, 500);
+  }
+});
+
+// Push layout changes to any listening device (SSE, same channel as statuses).
+function broadcastLayoutChanged(): void {
+  broadcast({ layout: "changed" });
+}
 
 // Agent status reporting (called by CodeBuddy hook scripts).
 app.post("/hook/:session", async (c) => {

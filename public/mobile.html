@@ -367,6 +367,25 @@
     return readDone[name] === st.updatedAt ? 'idle' : 'done';
   }
 
+  // ===================== shared layout (from the desktop) ==================
+  // Groups/pins live on the server now (the desktop writes them); the phone
+  // only reads, so its list matches what the desktop shows.
+  let groups = [];            // [{id, name}]
+  let sessionGroup = {};      // name -> groupId
+  let pinned = [];            // names
+
+  async function loadLayout() {
+    try {
+      const d = await (await fetch('/layout')).json();
+      groups = safeParse(d['termx-groups'], []);
+      sessionGroup = safeParse(d['termx-session-group'], {});
+      pinned = safeParse(d['termx-pinned'], []);
+    } catch {}
+  }
+  function safeParse(v, fb) {
+    try { const r = JSON.parse(v); return r ?? fb; } catch { return fb; }
+  }
+
   function cardHtml(s, depth) {
     const pad = 12 + depth * 18;
     return `<div class="card" style="padding-left:${pad}px" onclick="openSession('${esc(s.name).replace(/'/g,"\\'")}')">
@@ -403,10 +422,27 @@
       };
       roots.forEach(r => walk(r, 0));
     }
-    const rest = sessions.filter(s => !placed.has(s.name));
-    if (rest.length) {
-      if (roots.length) html += '<div class="sec">其他会话</div>';
-      rest.forEach(s => { html += cardHtml(s, 0); });
+
+    // The rest follow the desktop's layout: pinned first, then each group,
+    // then everything ungrouped.
+    const rest = sessions.filter(s => !placed.has(s.name) && !pinned.includes(s.name));
+    const pinItems = sessions.filter(s => !placed.has(s.name) && pinned.includes(s.name));
+    if (pinItems.length) {
+      html += '<div class="sec">置顶</div>';
+      pinItems.forEach(s => { html += cardHtml(s, 0); });
+    }
+    const grouped = new Set();
+    for (const g of groups) {
+      const items = rest.filter(s => sessionGroup[s.name] === g.id);
+      if (!items.length) continue;
+      items.forEach(s => grouped.add(s.name));
+      html += `<div class="sec">${esc(g.name)}</div>`;
+      items.forEach(s => { html += cardHtml(s, 0); });
+    }
+    const ungrouped = rest.filter(s => !grouped.has(s.name));
+    if (ungrouped.length) {
+      html += '<div class="sec">其他会话</div>';
+      ungrouped.forEach(s => { html += cardHtml(s, 0); });
     }
     listEl.innerHTML = html || '<div class="sec">没有会话</div>';
   }
@@ -890,6 +926,9 @@
             pageTerm.classList.contains('active')) {
           markRead(d.session);
         }
+      } else if (d.layout === 'changed') {
+        // The desktop rearranged groups/pins — mirror it here.
+        loadLayout().then(() => { renderList(); });
       }
       if (pageList.classList.contains('active')) renderList();
       else updateHeader();
@@ -903,7 +942,7 @@
   outEl.style.fontSize = fontSize + 'px';
   applyWrap();
   syncViewport();
-  refreshAll();
+  loadLayout().then(() => refreshAll());
   connectEvents();
   setInterval(refreshAll, 10000);
 

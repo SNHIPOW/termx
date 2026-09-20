@@ -64,7 +64,7 @@ export function subscribe(fn: (payload: string) => void): () => void {
   return () => subscribers.delete(fn);
 }
 
-function broadcast(data: object): void {
+export function broadcast(data: object): void {
   const payload = `data: ${JSON.stringify(data)}\n\n`;
   for (const fn of subscribers) {
     try {

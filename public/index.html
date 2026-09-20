@@ -750,9 +750,51 @@
     let _branchSiblingCache = {};
     function currentBranchSiblings(key) { return (_branchSiblingCache[key] || []).slice(); }
 
-    function persistPinned()  { localStorage.setItem('termx-pinned', JSON.stringify(pinned)); }
-    function persistGroups()  { localStorage.setItem('termx-groups', JSON.stringify(groups)); }
-    function persistSessionGroup() { localStorage.setItem('termx-session-group', JSON.stringify(sessionGroup)); }
+    function persistPinned()  { localStorage.setItem('termx-pinned', JSON.stringify(pinned)); queueServerLayout(); }
+    function persistGroups()  { localStorage.setItem('termx-groups', JSON.stringify(groups)); queueServerLayout(); }
+    function persistSessionGroup() { localStorage.setItem('termx-session-group', JSON.stringify(sessionGroup)); queueServerLayout(); }
+
+    // --- Server-side layout sync -------------------------------------------
+    // localStorage is per-browser, so the phone could never see the desktop's
+    // groups. The layout also lives in a server-side file now; localStorage
+    // stays as a fast local cache. Every mutation funnels through these two.
+    const SERVER_LAYOUT_KEYS = ['termx-groups', 'termx-session-group', 'termx-pinned',
+                                'termx-pinned-collapsed', 'termx-session-order'];
+    let layoutSaveTimer = null;
+    function queueServerLayout() {
+      clearTimeout(layoutSaveTimer);
+      layoutSaveTimer = setTimeout(saveLayoutToServer, 400);
+    }
+    async function saveLayoutToServer() {
+      const body = {};
+      for (const k of SERVER_LAYOUT_KEYS) {
+        const v = localStorage.getItem(k);
+        if (v != null) body[k] = v;
+      }
+      try {
+        await fetch('/layout', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      } catch { /* offline: localStorage still has it; retried on next change */ }
+    }
+    // Pull the server layout once at startup and adopt it if it differs. The
+    // server wins on conflict: it's the shared truth across devices.
+    async function loadServerLayout() {
+      try {
+        const d = await (await fetch('/layout')).json();
+        let changed = false;
+        for (const k of SERVER_LAYOUT_KEYS) {
+          if (typeof d[k] === 'string' && d[k] !== localStorage.getItem(k)) {
+            localStorage.setItem(k, d[k]);
+            changed = true;
+          }
+        }
+        if (changed) location.reload();
+      } catch { /* server unreachable: keep local copy */ }
+    }
+    loadServerLayout();
+    // Live-sync: another device (or this one) changed the layout.
+    const _layoutSaveToServer = saveLayoutToServer;
+
     function isPinned(name) { return pinned.includes(name); }
     function groupById(id) { return groups.find(g => g.id === id); }
     function genGroupId() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
@@ -768,7 +810,7 @@
         persistSessionGroup();
       }
       const oi = sessionOrder.indexOf(oldName);
-      if (oi >= 0) { sessionOrder[oi] = newName; localStorage.setItem('termx-session-order', JSON.stringify(sessionOrder)); }
+      if (oi >= 0) { sessionOrder[oi] = newName; localStorage.setItem('termx-session-order', JSON.stringify(sessionOrder)); queueServerLayout(); }
       if (readDone[oldName] != null) {
         readDone[newName] = readDone[oldName];
         delete readDone[oldName];
@@ -1006,6 +1048,7 @@
       if (id === PINNED_KEY) {
         const cur = localStorage.getItem('termx-pinned-collapsed') === '1';
         localStorage.setItem('termx-pinned-collapsed', cur ? '0' : '1');
+        queueServerLayout();
       } else if (id === UNGROUPED_KEY) {
         return; // ungrouped section isn't collapsible
       } else {
@@ -1034,6 +1077,7 @@
     function persistOrder() {
       sessionOrder = sessions.map(s => s.name);
       localStorage.setItem('termx-session-order', JSON.stringify(sessionOrder));
+      queueServerLayout();
     }
 
     // Assign a session to a drop-zone (PINNED_KEY / UNGROUPED_KEY / groupId).
@@ -1590,6 +1634,20 @@
           // (blinks) from one already recorded as read. Dropping it made every
           // live 'done' look already-read and stop blinking.
           applyStatus(data.session, { status: data.status, message: data.message, updatedAt: data.updatedAt });
+        } else if (data.layout === 'changed') {
+          // Another device updated the shared layout. Pull it in and re-render.
+          // (This event also fires for our own saves; the reload is skipped
+          // because the local copy already matches after the debounced write.)
+          fetch('/layout').then(r => r.json()).then(d => {
+            let changed = false;
+            for (const k of SERVER_LAYOUT_KEYS) {
+              if (typeof d[k] === 'string' && d[k] !== localStorage.getItem(k)) {
+                localStorage.setItem(k, d[k]);
+                changed = true;
+              }
+            }
+            if (changed) location.reload();
+          }).catch(() => {});
         }
       };
       es.onerror = () => { /* EventSource auto-reconnects */ };

@@ -81,7 +81,8 @@ http://<host>:<port>/m      # e.g. http://<host>:17681/m
 It's app-shaped rather than desktop-shaped:
 
 - **Two screens** — a session list, then tap into a session. Branch agents are
-  nested under their parent, same as the desktop sidebar.
+  nested under their parent; groups, pins and ordering come from the server, so
+  the list matches the desktop's sidebar.
 - **No terminal grid.** The session view isn't xterm: the server snapshots the
   pane with `tmux capture-pane` and the page renders that text (ANSI colours
   included) as ordinary HTML. A phone can't display the session's real width,
@@ -132,6 +133,8 @@ Sessions are listed as cards with a live status dot. Beyond plain switching:
   order, theme) lives in `localStorage`, which is scoped per origin. If you
   reach termx through a different URL (localhost vs LAN IP vs a tunnel), the
   sidebar starts empty. Export on the old URL, import on the new one.
+  Groups/pins/order are *also* mirrored to the server (`~/.termx-layout.json`)
+  so the mobile UI sees the same layout without any manual transfer.
 
 ### Branch agents (optional)
 
@@ -267,6 +270,8 @@ Env vars honored by the script:
 | POST | `/m/send/:session` | Mobile: type `{ text }` into the session, then Enter (two-stage) |
 | POST | `/m/key/:session` | Mobile: send one named key `{ key }` (whitelisted) |
 | GET | `/m/capture/:session?lines=N` | Mobile: pane snapshot as text with ANSI colours (gzipped) |
+| GET | `/layout` | Shared sidebar layout (groups/pins/order) as JSON |
+| POST | `/layout` | Replace the shared layout. Body: `{ "termx-groups": "…", … }` |
 
 ### WebSocket
 

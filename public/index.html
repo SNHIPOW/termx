@@ -776,19 +776,46 @@
           headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       } catch { /* offline: localStorage still has it; retried on next change */ }
     }
-    // Pull the server layout once at startup and adopt it if it differs. The
-    // server wins on conflict: it's the shared truth across devices.
+    // Pull the server layout once at startup and adopt it if it differs.
+    // Merge rules (an empty server copy must NOT wipe a populated local one —
+    // that exact accident destroyed a real layout once):
+    //  - local empty, server has data   -> adopt the server's
+    //  - local has data, server empty   -> push the local one up (it's newer
+    //                                       or the server was never seeded)
+    //  - both non-empty and different   -> server wins (cross-device truth)
+    //  - keys missing server-side       -> leave local alone
     async function loadServerLayout() {
       try {
         const d = await (await fetch('/layout')).json();
-        let changed = false;
+        const localEmpty = (k) => {
+          const v = localStorage.getItem(k);
+          if (v == null) return true;
+          try { const parsed = JSON.parse(v); return parsed == null ||
+            (Array.isArray(parsed) && parsed.length === 0) ||
+            (typeof parsed === 'object' && !Array.isArray(parsed) &&
+             Object.keys(parsed).length === 0); }
+          catch { return false; }
+        };
+        const serverEmpty = (k) => {
+          const v = d[k];
+          if (typeof v !== 'string') return true; // missing = no opinion
+          try { const parsed = JSON.parse(v); return parsed == null ||
+            (Array.isArray(parsed) && parsed.length === 0) ||
+            (typeof parsed === 'object' && !Array.isArray(parsed) &&
+             Object.keys(parsed).length === 0); }
+          catch { return false; }
+        };
+        let adopt = false;
         for (const k of SERVER_LAYOUT_KEYS) {
-          if (typeof d[k] === 'string' && d[k] !== localStorage.getItem(k)) {
-            localStorage.setItem(k, d[k]);
-            changed = true;
-          }
+          if (typeof d[k] !== 'string' || d[k] === localStorage.getItem(k)) continue;
+          if (serverEmpty(k) && !localEmpty(k)) continue;  // protect local data
+          localStorage.setItem(k, d[k]);
+          adopt = true;
         }
-        if (changed) location.reload();
+        // Local has content the server lacks: seed the server from it.
+        const localHasMore = SERVER_LAYOUT_KEYS.some(k => !localEmpty(k) && serverEmpty(k));
+        if (localHasMore) { saveLayoutToServer(); return; }
+        if (adopt) location.reload();
       } catch { /* server unreachable: keep local copy */ }
     }
     loadServerLayout();
@@ -1638,13 +1665,23 @@
           // Another device updated the shared layout. Pull it in and re-render.
           // (This event also fires for our own saves; the reload is skipped
           // because the local copy already matches after the debounced write.)
+          // An empty incoming key never wipes a populated local one — the
+          // layout keys carry independent data, so an empty group list from a
+          // stale writer must not erase pins or vice versa.
           fetch('/layout').then(r => r.json()).then(d => {
             let changed = false;
+            const isEmptyVal = (v) => {
+              if (typeof v !== 'string') return true;
+              try { const p = JSON.parse(v); return p == null ||
+                (Array.isArray(p) && p.length === 0) ||
+                (typeof p === 'object' && !Array.isArray(p) && Object.keys(p).length === 0); }
+              catch { return false; }
+            };
             for (const k of SERVER_LAYOUT_KEYS) {
-              if (typeof d[k] === 'string' && d[k] !== localStorage.getItem(k)) {
-                localStorage.setItem(k, d[k]);
-                changed = true;
-              }
+              if (typeof d[k] !== 'string' || d[k] === localStorage.getItem(k)) continue;
+              if (isEmptyVal(d[k]) && !isEmptyVal(localStorage.getItem(k))) continue;
+              localStorage.setItem(k, d[k]);
+              changed = true;
             }
             if (changed) location.reload();
           }).catch(() => {});

@@ -49,9 +49,19 @@ app.use("*", cors());
 
 // Mobile UI. Registered BEFORE serveStatic so the static middleware doesn't
 // swallow "/m" (it would 404 looking for a file of that name).
+// Read the file into a string rather than streaming Bun.file: streaming left
+// `content-length: 0` on the response, which some browsers treat as an empty
+// document (the page simply never appeared on the phone). no-store keeps a
+// stale copy from hanging around after an update.
 app.get("/m", async (c) => {
-  const f = Bun.file(join(PUBLIC_DIR, "mobile.html"));
-  return new Response(f, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  const html = await Bun.file(join(PUBLIC_DIR, "mobile.html")).text();
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Length": String(new TextEncoder().encode(html).length),
+      "Cache-Control": "no-store, must-revalidate",
+    },
+  });
 });
 
 app.use("/*", serveStatic({ root: PUBLIC_DIR }));
@@ -278,6 +288,42 @@ app.post("/m/key/:session", async (c) => {
   return ok ? c.json({ success: true }) : c.json({ success: false }, 404);
 });
 
+// Snapshot a session's visible buffer as text (with ANSI colours).
+// The mobile UI renders this as flowing HTML instead of a fixed cols x rows
+// grid: a phone can't show the session's real width, and forcing xterm to that
+// geometry is what made the mobile view impossible to fit to the screen.
+//   -p print to stdout, -e keep colours, -J unwrap lines tmux hard-wrapped
+app.get("/m/capture/:session", async (c) => {
+  const session = c.req.param("session");
+  const linesParam = parseInt(c.req.query("lines") || "120", 10);
+  const lines = Math.min(Math.max(Number.isNaN(linesParam) ? 120 : linesParam, 20), 20000);
+  try {
+    const p = spawn(["tmux", "capture-pane", "-p", "-e", "-J", "-t", session, "-S", `-${lines}`]);
+    const text = await new Response(p.stdout).text();
+    if ((await p.exited) !== 0) return c.json({ ok: false, error: "capture failed" }, 404);
+
+    const body = JSON.stringify({ ok: true, text });
+    // Terminal output is highly repetitive, so gzip buys roughly 10x here. That
+    // matters: on a phone this link measured ~8KB/s with heavy retransmits, and
+    // an uncompressed capture simply never finished arriving.
+    if ((c.req.header("accept-encoding") || "").includes("gzip")) {
+      const gz = Bun.gzipSync(new TextEncoder().encode(body));
+      return new Response(gz, {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Encoding": "gzip",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+    return new Response(body, {
+      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  } catch {
+    return c.json({ ok: false, error: "capture failed" }, 500);
+  }
+});
+
 // Agent status reporting (called by CodeBuddy hook scripts).
 app.post("/hook/:session", async (c) => {
   const session = c.req.param("session");
@@ -330,6 +376,10 @@ await sendCommand({ action: "ensureDefault", cwd: SESSION_CWD });
 const server = Bun.serve<WsData>({
   port: PORT,
   hostname: "0.0.0.0",
+  // Bun cuts requests off after 10s by default. A phone on mobile data pulling
+  // a capture can legitimately take longer than that; the truncated responses
+  // showed up as connections stuck in FIN-WAIT and a client that "can't connect".
+  idleTimeout: 30,
   fetch(req, server) {
     const url = new URL(req.url);
     const wsMatch = url.pathname.match(/^\/ws\/([^/]+)$/);

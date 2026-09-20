@@ -44,6 +44,19 @@ termx --port 3000 --theme Dracula
 termx -p 3000 -t "Tokyo Night"
 ```
 
+### Picking a port
+
+`7681` is the default, but it's also ttyd's default — if something else already
+holds it locally, the port forward silently fails and the page just won't load.
+Pick something out of the way instead:
+
+```bash
+PORT=17681 termx          # the port this fork is normally run on
+```
+
+> **Ports in use here:** `17681`. If you're sharing a machine, claim a different
+> one so we don't collide.
+
 ## Themes
 
 - Dark
@@ -62,31 +75,46 @@ The desktop layout doesn't work well on a phone, so there's a separate mobile
 page on the **same port**:
 
 ```
-http://<host>:7681/m
+http://<host>:<port>/m      # e.g. http://<host>:17681/m
 ```
 
 It's app-shaped rather than desktop-shaped:
 
 - **Two screens** — a session list, then tap into a session. Branch agents are
   nested under their parent, same as the desktop sidebar.
-- **Input is decoupled from the terminal.** The terminal view is read-only
-  (`disableStdin`); you type in a normal text box at the bottom and press send.
-  This avoids fighting the mobile keyboard over cursor position, and means
-  autocorrect can't scribble into a live TUI.
+- **No terminal grid.** The session view isn't xterm: the server snapshots the
+  pane with `tmux capture-pane` and the page renders that text (ANSI colours
+  included) as ordinary HTML. A phone can't display the session's real width,
+  and forcing xterm to that geometry is what made the view impossible to fit to
+  the screen — font size never lined up and the bottom never met the bottom.
+- **Two layouts** (`⇥` in the header): *aligned* keeps tmux's columns intact and
+  scrolls sideways — box drawing, tables and code stay readable; *reading*
+  reflows to the screen width, which is nicer for prose but scrambles anything
+  drawn with box characters.
+- **Input is decoupled from the terminal.** You type in a normal text box at the
+  bottom and press send, so the mobile keyboard never fights the terminal over
+  cursor position and autocorrect can't scribble into a live TUI.
 - **Key bar** for things a phone keyboard can't produce: `Esc`, `⇧Tab`
   (switches the agent's mode — the main reason this bar exists), arrows, Enter,
   plus an expandable row with `Tab`, `y`/`n`, `^C`, `^D`, `^R`, PgUp/PgDn,
   Home/End. `Ctrl` is sticky: tap it, then tap a letter.
-- **A+ / A−** font size control (remembered), auto-sized for the screen on
-  first run.
-- **Touch scrolling** is implemented explicitly (xterm doesn't turn touch drags
-  into scrolls) and the keyboard is handled through `visualViewport`, so the
-  composer isn't hidden behind it on iOS.
+- **Slash commands** (`/` next to the composer): session management (`/clear`,
+  `/compact`, `/context`, `/todos`, `/cost`), agent control (`/goal`, `/plan`,
+  `/btw`) and status (`/status`, `/resume`, `/model`, `/bashes`). Commands that
+  take an argument prefill the composer instead of firing immediately.
+- **A+ / A−** font size (remembered), auto-sized for the screen on first run.
+- **History on demand** — the first screen is deliberately small so it arrives
+  quickly; "↑ 加载更早" pulls older scrollback in steps. Polling backs off as the
+  window grows, and responses are gzipped (terminal text compresses ~4x).
 
 How text reaches the agent: the server types it with `tmux send-keys -l`, waits
 a moment, then sends `Enter` as a separate key. Both steps are required — TUI
 prompts debounce their input and swallow an `Enter` that arrives in the same
 frame as the text.
+
+> **If the page won't load after an update**, it's almost certainly a cached
+> copy. `/m` is served with `Cache-Control: no-store`, but a phone that cached
+> an earlier response will keep it — hard-reload, or open it in a private tab.
 
 ## Session Sidebar
 
@@ -238,6 +266,7 @@ Env vars honored by the script:
 | GET | `/branches` | Branch-agent tree: `[{ name, parent }]` parsed from `run-state` STATUS.md |
 | POST | `/m/send/:session` | Mobile: type `{ text }` into the session, then Enter (two-stage) |
 | POST | `/m/key/:session` | Mobile: send one named key `{ key }` (whitelisted) |
+| GET | `/m/capture/:session?lines=N` | Mobile: pane snapshot as text with ANSI colours (gzipped) |
 
 ### WebSocket
 

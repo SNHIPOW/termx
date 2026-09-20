@@ -8,7 +8,6 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <title>termx mobile</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.min.css">
   <style>
     :root {
       --bg: #1e1e1e;
@@ -87,12 +86,38 @@
     }
 
     /* ---------- session page ---------- */
+    /* The session view is plain text captured from tmux, not an xterm grid.
+       A phone can't display the session's real width, and forcing xterm to that
+       geometry is exactly what made the view impossible to fit to the screen. */
     #termWrap {
       flex: 1; min-height: 0; position: relative;
-      background: var(--bg); overflow: hidden;
-      touch-action: none;           /* we translate touch into scroll ourselves */
+      background: var(--bg);
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
     }
-    #term { position: absolute; inset: 0; }
+    #out {
+      margin: 0; padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; line-height: 1.35;
+      color: var(--fg);
+      /* "aligned" mode (default): keep tmux's column alignment intact, scroll
+         sideways. Box drawing / tables / code stay readable. */
+      white-space: pre;
+      tab-size: 4;
+    }
+    /* "reading" mode: reflow to the screen width. Comfortable for prose, but
+       it breaks the alignment of anything drawn with box characters. */
+    #out.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #btnWrap.on { background: var(--accent-soft); }
+    #btnMore {
+      display: block; width: calc(100% - 24px); margin: 8px 12px 0;
+      padding: 9px; border-radius: 8px;
+      background: var(--bg-elev2); border: 1px solid var(--border);
+      color: var(--fg-dim); font-size: 13px;
+    }
+    #btnMore:active:not(:disabled) { background: var(--accent-soft); color: var(--fg); }
+    #btnMore:disabled { opacity: .45; }
 
     #inputBar {
       flex: none;
@@ -132,6 +157,50 @@
     }
     #send:disabled { opacity: .4; }
     #send:active { filter: brightness(.9); }
+    #btnSlash {
+      flex: none; width: 38px; height: 42px; border-radius: 10px;
+      background: var(--bg-elev2); border: 1px solid var(--border);
+      color: var(--accent); font-size: 19px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #btnSlash:active { background: var(--accent-soft); }
+
+    /* ---------- slash command sheet ---------- */
+    #slashSheet { position: fixed; inset: 0; z-index: 90; }
+    #slashSheet.hidden { display: none; }
+    .sheet-mask { position: absolute; inset: 0; background: rgba(0,0,0,.5); }
+    .sheet-body {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      max-height: 70%; display: flex; flex-direction: column;
+      background: var(--bg-elev); border-top: 1px solid var(--border);
+      border-radius: 14px 14px 0 0;
+      padding-bottom: var(--safe-b);
+    }
+    .sheet-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+      font-size: 13px; font-weight: 600; color: var(--fg-dim);
+    }
+    .sheet-head button { font-size: 22px; color: var(--fg-dim); padding: 0 6px; }
+    #slashList { overflow-y: auto; padding: 6px 0 12px; }
+    .slash-group {
+      font-size: 11px; font-weight: 700; letter-spacing: .05em;
+      color: var(--fg-dim); padding: 12px 16px 4px;
+    }
+    .slash-item {
+      display: flex; align-items: baseline; gap: 10px;
+      padding: 11px 16px;
+    }
+    .slash-item:active { background: var(--bg-elev2); }
+    .slash-item .cmd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 14px; color: var(--accent); flex: none;
+    }
+    .slash-item .desc { font-size: 12px; color: var(--fg-dim); }
+    .slash-item .arg {
+      font-size: 10px; color: var(--fg-dim); border: 1px solid var(--border);
+      border-radius: 4px; padding: 1px 5px; flex: none;
+    }
 
     .toast {
       position: fixed; left: 50%; bottom: calc(96px + var(--safe-b));
@@ -160,17 +229,21 @@
         <button class="icon" onclick="goList()" title="返回">‹</button>
         <span class="dot" id="sDot"></span>
         <span class="title grow truncate" id="sName"></span>
+        <button class="icon" id="btnWrap" onclick="toggleWrap()" title="排版模式">⇥</button>
         <button class="icon" onclick="fontStep(-1)" title="缩小">A−</button>
         <button class="icon" onclick="fontStep(1)" title="放大">A+</button>
-        <button class="icon" onclick="doRedraw()" title="重绘">⟳</button>
       </header>
 
-      <div id="termWrap"><div id="term"></div></div>
+      <div id="termWrap">
+        <button id="btnMore" onclick="loadMore()">↑ 加载更早</button>
+        <pre id="out"></pre>
+      </div>
 
       <div id="inputBar">
         <div class="keys" id="keysMain"></div>
         <div class="keys" id="keysMore"></div>
         <div class="composer">
+          <button id="btnSlash" onclick="toggleSlash(event)" title="斜杠命令">/</button>
           <textarea id="input" rows="1" placeholder="输入消息…"
             inputmode="text" autocomplete="off" autocorrect="off"
             autocapitalize="off" spellcheck="false"></textarea>
@@ -180,10 +253,20 @@
     </section>
   </div>
 
+  <!-- Slash command sheet -->
+  <div id="slashSheet" class="hidden">
+    <div class="sheet-mask" onclick="closeSlash()"></div>
+    <div class="sheet-body">
+      <div class="sheet-head">
+        <span>斜杠命令</span>
+        <button onclick="closeSlash()">×</button>
+      </div>
+      <div id="slashList"></div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js"></script>
   <script>
   'use strict';
 
@@ -198,7 +281,7 @@
     document.documentElement.style.setProperty('--app-h', h + 'px');
     // Keep the page pinned to the top; iOS likes to scroll the whole document.
     window.scrollTo(0, 0);
-    if (term && fit && pageTerm.classList.contains('active')) scheduleFit();
+    if (pageTerm.classList.contains('active')) keepBottom();
   }
   if (vv) {
     vv.addEventListener('resize', syncViewport);
@@ -216,13 +299,20 @@
   const inputEl  = document.getElementById('input');
   const sendBtn  = document.getElementById('send');
   const toastEl  = document.getElementById('toast');
+  const outEl    = document.getElementById('out');
+  const wrapEl   = document.getElementById('termWrap');
 
   let sessions = [];        // [{name, status}]
   let branches = [];        // [{name, parent}]
   let statusMap = {};       // name -> {status, message}
   let current = null;       // active session name
-  let term = null, fit = null, ws = null, wsReady = false;
-  let hbTimer = null, retryTimer = null, retry = 0, lastPong = 0, connId = 0;
+
+  // Pin the view to the newest output unless the user scrolled up to read back.
+  function keepBottom() {
+    if (!wrapEl) return;
+    const nearBottom = wrapEl.scrollHeight - wrapEl.scrollTop - wrapEl.clientHeight < 60;
+    if (nearBottom) wrapEl.scrollTop = wrapEl.scrollHeight;
+  }
 
   const FONT_KEY = 'termx-m-font';
   let fontSize = parseInt(localStorage.getItem(FONT_KEY) || '0', 10) || autoFont();
@@ -252,10 +342,35 @@
   }
 
   // ===================== list page ========================================
+  // A 'done' the user has already looked at shouldn't keep blinking white.
+  // Keyed by the status timestamp, so a NEW completion blinks again.
+  const READ_KEY = 'termx-m-read';
+  let readDone = {};
+  try { readDone = JSON.parse(localStorage.getItem(READ_KEY) || '{}'); } catch {}
+
+  function markRead(name) {
+    const st = statusMap[name];
+    if (st && st.status === 'done') {
+      readDone[name] = st.updatedAt || 0;
+      try { localStorage.setItem(READ_KEY, JSON.stringify(readDone)); } catch {}
+    }
+  }
+
+  // Status used for display: a viewed 'done' collapses to a calm gray dot.
+  function dotOf(name) {
+    const s = statusOf(name);
+    if (s !== 'done') return s;
+    const st = statusMap[name];
+    // No live entry (only the /sessions fallback) => it was already done when
+    // the page loaded; treat as seen so a refresh doesn't resurrect blinking.
+    if (!st || st.updatedAt == null) return 'idle';
+    return readDone[name] === st.updatedAt ? 'idle' : 'done';
+  }
+
   function cardHtml(s, depth) {
     const pad = 12 + depth * 18;
     return `<div class="card" style="padding-left:${pad}px" onclick="openSession('${esc(s.name).replace(/'/g,"\\'")}')">
-      <span class="dot ${statusOf(s.name)}"></span>
+      <span class="dot ${dotOf(s.name)}"></span>
       <span class="name grow truncate">${esc(s.name)}</span>
       <span class="chev">›</span>
     </div>`;
@@ -314,186 +429,262 @@
     pageTerm.classList.remove('active');
     pageList.classList.add('active');
     inputEl.blur();
-    // Keep the socket open in the background so output isn't missed.
+    closeSlash();
+    stopPolling();          // nothing to show while the list is up
     renderList();
   }
 
   function updateHeader() {
     if (!current) return;
     sNameEl.textContent = current;
-    sDotEl.className = 'dot ' + statusOf(current);
+    sDotEl.className = 'dot ' + dotOf(current);
   }
 
   function openSession(name) {
     current = name;
+    markRead(name);              // you're looking at it: stop the white blink
     pageList.classList.remove('active');
     pageTerm.classList.add('active');
     updateHeader();
-    ensureTerm();
-    connect(name);
-    scheduleFit();
+    outEl.innerHTML = '';
+    lastText = null;
+    captureLines = CAPTURE_START;   // fresh history window per session
+    atMaxHistory = false;
+    updateMoreBtn();
+    startPolling();
   }
 
-  function ensureTerm() {
-    if (term) return;
-    term = new Terminal({
-      fontSize,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      scrollback: 3000,
-      cursorBlink: false,
-      // Input is decoupled: typing happens in the composer, not the terminal.
-      disableStdin: true,
-      theme: {
-        background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#d4d4d4',
-        black:'#000000', red:'#cd3131', green:'#0dbc79', yellow:'#e5e510',
-        blue:'#2472c8', magenta:'#bc3fbc', cyan:'#11a8cd', white:'#e5e5e5',
-        brightBlack:'#666666', brightRed:'#f14c4c', brightGreen:'#23d18b',
-        brightYellow:'#f5f543', brightBlue:'#3b8eea', brightMagenta:'#d670d6',
-        brightCyan:'#29b8db', brightWhite:'#ffffff',
-      },
-    });
-    fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open(document.getElementById('term'));
-    // Deliberately NO WebGL addon: mobile GPUs are tight on contexts and the
-    // DOM renderer is plenty for a read-only view.
-    wireTouchScroll();
+  // ===================== ANSI -> HTML =====================================
+  // tmux gives us the pane contents with SGR escapes still in them. We only
+  // need the subset it actually emits: reset, bold, dim, inverse, the 8/16
+  // colours, and 256-colour (38;5;N / 48;5;N).
+  const BASE16 = [
+    '#000000','#cd3131','#0dbc79','#e5e510','#2472c8','#bc3fbc','#11a8cd','#e5e5e5',
+    '#666666','#f14c4c','#23d18b','#f5f543','#3b8eea','#d670d6','#29b8db','#ffffff',
+  ];
+
+  function xterm256(n) {
+    if (n < 16) return BASE16[n];
+    if (n < 232) {
+      n -= 16;
+      const to = (v) => (v === 0 ? 0 : 55 + v * 40);
+      return `rgb(${to(Math.floor(n / 36) % 6)},${to(Math.floor(n / 6) % 6)},${to(n % 6)})`;
+    }
+    const g = 8 + (n - 232) * 10;
+    return `rgb(${g},${g},${g})`;
   }
 
-  let fitRaf = 0;
-  function scheduleFit() {
-    if (fitRaf) return;
-    fitRaf = requestAnimationFrame(() => {
-      fitRaf = 0;
-      if (!fit || !term) return;
-      try { fit.fit(); } catch {}
-      sendResize();
-    });
+  const ESC_HTML = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+  const escText = (s) => s.replace(/[&<>]/g, (c) => ESC_HTML[c]);
+
+  function ansiToHtml(input) {
+    let fg = null, bg = null, bold = false, dim = false, inverse = false, underline = false;
+    let out = '';
+    let open = false;
+
+    const closeSpan = () => { if (open) { out += '</span>'; open = false; } };
+    const openSpan = () => {
+      let f = fg, b = bg;
+      if (inverse) { const t = f; f = b || '#1e1e1e'; b = t || '#d4d4d4'; }
+      const st = [];
+      if (f) st.push(`color:${f}`);
+      if (b) st.push(`background:${b}`);
+      if (bold) st.push('font-weight:700');
+      if (dim) st.push('opacity:.6');
+      if (underline) st.push('text-decoration:underline');
+      if (!st.length) return;
+      out += `<span style="${st.join(';')}">`;
+      open = true;
+    };
+
+    // Split on SGR sequences; ignore any other escape sequence.
+    const re = /\x1b\[([0-9;]*)m|\x1b\[[0-9;?]*[A-Za-z]/g;
+    let last = 0, m;
+    while ((m = re.exec(input)) !== null) {
+      if (m.index > last) { openSpan(); out += escText(input.slice(last, m.index)); closeSpan(); }
+      last = re.lastIndex;
+      if (m[1] === undefined) continue;          // non-SGR escape: drop it
+      const codes = m[1] === '' ? [0] : m[1].split(';').map(Number);
+      for (let i = 0; i < codes.length; i++) {
+        const c = codes[i];
+        if (c === 0) { fg = bg = null; bold = dim = inverse = underline = false; }
+        else if (c === 1) bold = true;
+        else if (c === 2) dim = true;
+        else if (c === 4) underline = true;
+        else if (c === 7) inverse = true;
+        else if (c === 22) { bold = false; dim = false; }
+        else if (c === 24) underline = false;
+        else if (c === 27) inverse = false;
+        else if (c >= 30 && c <= 37) fg = BASE16[c - 30];
+        else if (c === 39) fg = null;
+        else if (c >= 40 && c <= 47) bg = BASE16[c - 40];
+        else if (c === 49) bg = null;
+        else if (c >= 90 && c <= 97) fg = BASE16[c - 90 + 8];
+        else if (c >= 100 && c <= 107) bg = BASE16[c - 100 + 8];
+        else if ((c === 38 || c === 48) && codes[i + 1] === 5) {
+          const col = xterm256(codes[i + 2]);
+          if (c === 38) fg = col; else bg = col;
+          i += 2;
+        } else if ((c === 38 || c === 48) && codes[i + 1] === 2) {
+          const col = `rgb(${codes[i + 2]},${codes[i + 3]},${codes[i + 4]})`;
+          if (c === 38) fg = col; else bg = col;
+          i += 4;
+        }
+      }
+    }
+    if (last < input.length) { openSpan(); out += escText(input.slice(last)); closeSpan(); }
+    return out;
   }
 
-  let sentCols = 0, sentRows = 0;
-  function sendResize() {
-    if (!ws || ws.readyState !== WebSocket.OPEN || !term) return;
-    const c = term.cols, r = term.rows;
-    if (c === sentCols && r === sentRows) return;  // tmux redraws on every resize
-    sentCols = c; sentRows = r;
-    ws.send(JSON.stringify({ type: 'resize', cols: c, rows: r }));
+  // ===================== capture polling ==================================
+  // Instead of streaming a PTY into a fixed grid, snapshot the pane as text and
+  // render it as flowing HTML. Cheap (capture-pane is ~20ms even for 5k lines)
+  // and it lets the phone pick its own width and font size.
+  //
+  // How much history to pull is a payload tradeoff, not a capture one: ~90 bytes
+  // per line, re-fetched on every poll. Keep the default small enough for a
+  // phone on mobile data (a 1500-line default meant ~157KB/s, which stalled the
+  // connection outright) and let the user pull more on demand.
+  // Payload budget, not a capture budget: ~90 bytes per line, re-sent on every
+  // poll. Measured on a real phone the uplink can drop to ~8KB/s with 40%
+  // retransmits, so the first screen has to be small enough to actually arrive.
+  // More history is opt-in via the button.
+  const CAPTURE_START = 120;
+  const CAPTURE_STEP  = 400;
+  const CAPTURE_MAX   = 8000;    // ~700KB; beyond this a phone just chokes
+  const POLL_MS       = 1500;
+  const FETCH_TIMEOUT = 8000;
+  let captureLines = CAPTURE_START;
+  let pollTimer = null, lastText = null, polling = false;
+  let atMaxHistory = false;   // server returned fewer lines than we asked for
+  let loadedLines = 0;        // lines actually rendered (not what we asked for)
+  let captureSeq = 0;         // guards against out-of-order responses
+
+  async function pullCapture(opts = {}) {
+    if (!current || (polling && !opts.force)) return;
+    // Sequence number so a slow, superseded request can't overwrite the view
+    // that a newer one already painted.
+    const my = ++captureSeq;
+    const sessionAtStart = current;
+    polling = true;
+    // Abort a stalled request instead of letting them pile up on a slow link.
+    // Scale the budget with the payload: a 20k-line pull is legitimately slow
+    // on mobile data and shouldn't be killed as if it were a normal tick.
+    const ac = new AbortController();
+    const budget = Math.min(FETCH_TIMEOUT + captureLines * 8, 45000);
+    const killer = setTimeout(() => ac.abort(), budget);
+    try {
+      const r = await fetch(
+        `/m/capture/${encodeURIComponent(current)}?lines=${captureLines}`,
+        { signal: ac.signal });
+      const j = await r.json();
+      // Superseded by a newer request, or the user switched session: drop it.
+      if (my !== captureSeq || current !== sessionAtStart) return;
+      if (!j.ok || typeof j.text !== 'string') return;
+
+      // Work out how much history actually exists BEFORE any early return.
+      // Doing this after the "unchanged" check meant that once we'd reached the
+      // oldest line the flag was never set: the button stayed enabled and
+      // captureLines kept growing while the view never gained a single row.
+      loadedLines = j.text.split('\n').length;
+      atMaxHistory = loadedLines < captureLines - 5;
+      updateMoreBtn();
+
+      if (j.text === lastText && !opts.force) return;   // unchanged, keep DOM
+      lastText = j.text;
+
+      const nearBottom = wrapEl.scrollHeight - wrapEl.scrollTop - wrapEl.clientHeight < 60;
+      // When loading older history, keep the line the user was reading in place
+      // instead of yanking the view around.
+      const prevH = wrapEl.scrollHeight, prevTop = wrapEl.scrollTop;
+
+      outEl.innerHTML = ansiToHtml(j.text.replace(/\s+$/, ''));
+
+      if (opts.keepPosition) {
+        wrapEl.scrollTop = prevTop + (wrapEl.scrollHeight - prevH);
+      } else if (nearBottom) {
+        wrapEl.scrollTop = wrapEl.scrollHeight;
+      }
+    } catch {
+      /* transient failure (incl. timeout): the next tick retries */
+    } finally {
+      clearTimeout(killer);
+      // Only the newest request may release the lock, otherwise a slow straggler
+      // finishing late would unlock while a fresh request is still running.
+      if (my === captureSeq) polling = false;
+    }
   }
 
+  // Pull an older chunk of scrollback.
+  // Runs exclusively: stop the poll loop first, otherwise an in-flight poll
+  // makes pullCapture() bail on its `polling` guard and the click does nothing
+  // (captureLines would grow while the view never refreshed).
+  async function loadMore() {
+    if (atMaxHistory || captureLines >= CAPTURE_MAX) return;
+    const btn = document.getElementById('btnMore');
+    stopPolling();
+    captureLines = Math.min(captureLines + CAPTURE_STEP, CAPTURE_MAX);
+    if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+    try {
+      // force: bypass the in-flight guard; the sequence number keeps the older
+      // request from clobbering what this one paints.
+      await pullCapture({ force: true, keepPosition: true });
+      // Report what actually arrived, not what we asked for — with a short
+      // history those differ wildly and the old message was just misleading.
+      toast(atMaxHistory ? `已是全部 ${loadedLines} 行` : `已加载 ${loadedLines} 行`);
+    } finally {
+      updateMoreBtn();
+      if (current && pageTerm.classList.contains('active')) startPolling();
+    }
+  }
+
+  // Bigger windows mean a bigger payload on every tick, so back the poll off as
+  // history grows — on mobile data a 500KB/1.5s loop just kills the connection.
+  function pollInterval() {
+    if (captureLines <= 500) return POLL_MS;
+    if (captureLines <= 2000) return 3000;
+    return 6000;
+  }
+
+  function updateMoreBtn() {
+    const b = document.getElementById('btnMore');
+    if (!b) return;
+    const done = atMaxHistory || captureLines >= CAPTURE_MAX;
+    b.textContent = done ? '已到最早' : '↑ 加载更早';
+    b.disabled = done;
+  }
+
+  function startPolling() {
+    stopPolling();
+    pullCapture();
+    pollTimer = setInterval(pullCapture, pollInterval());
+  }
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ===================== view controls ====================================
   function fontStep(d) {
-    fontSize = Math.max(8, Math.min(22, fontSize + d));
+    fontSize = Math.max(8, Math.min(24, fontSize + d));
     localStorage.setItem(FONT_KEY, String(fontSize));
-    if (term) { term.options.fontSize = fontSize; scheduleFit(); }
+    outEl.style.fontSize = fontSize + 'px';
     toast('字号 ' + fontSize);
   }
 
-  // xterm doesn't turn touch drags into scrolling, so do it ourselves and feed
-  // the terminal wheel-equivalent scrolls.
-  function wireTouchScroll() {
-    const el = document.getElementById('termWrap');
-    let startY = 0, lastY = 0, acc = 0, dragging = false;
-    el.addEventListener('touchstart', (e) => {
-      if (e.touches.length !== 1) return;
-      dragging = true; startY = lastY = e.touches[0].clientY; acc = 0;
-    }, { passive: true });
-    el.addEventListener('touchmove', (e) => {
-      if (!dragging || e.touches.length !== 1 || !term) return;
-      const y = e.touches[0].clientY;
-      acc += (lastY - y);
-      lastY = y;
-      const cell = Math.max(12, fontSize * 1.4);
-      const lines = Math.trunc(acc / cell);
-      if (lines !== 0) { term.scrollLines(lines); acc -= lines * cell; }
-      e.preventDefault();
-    }, { passive: false });
-    const end = () => { dragging = false; };
-    el.addEventListener('touchend', end, { passive: true });
-    el.addEventListener('touchcancel', end, { passive: true });
+  const WRAP_KEY = 'termx-m-wrap';
+  let wrapMode = localStorage.getItem(WRAP_KEY) === '1';
+  function applyWrap() {
+    outEl.classList.toggle('wrap', wrapMode);
+    const b = document.getElementById('btnWrap');
+    if (b) { b.classList.toggle('on', wrapMode); b.textContent = wrapMode ? '↵' : '⇥'; }
+  }
+  function toggleWrap() {
+    wrapMode = !wrapMode;
+    localStorage.setItem(WRAP_KEY, wrapMode ? '1' : '0');
+    applyWrap();
+    toast(wrapMode ? '阅读模式（自动换行）' : '对齐模式（横向滚动）');
   }
 
-  // ===================== websocket (receive only) =========================
-  function connect(name) {
-    // Reuse the socket if we're already on this session.
-    if (ws && ws._session === name &&
-        (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    closeSocket();
-    term.reset();
-    openSocket(name);
-  }
-
-  function closeSocket() {
-    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-    connId++;
-    if (ws) {
-      try { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; ws.close(); } catch {}
-      ws = null;
-    }
-    wsReady = false; sentCols = 0; sentRows = 0;
-  }
-
-  function openSocket(name) {
-    const my = ++connId;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ok = term && term.cols >= 20 && term.rows >= 5;
-    const q = ok ? `?resize=${term.cols},${term.rows}` : '';
-    if (ok) { sentCols = term.cols; sentRows = term.rows; }
-    const sock = new WebSocket(`${proto}//${location.host}/ws/${encodeURIComponent(name)}${q}`);
-    sock._session = name;
-    sock.binaryType = 'arraybuffer';
-    ws = sock;
-
-    sock.onopen = () => {
-      if (my !== connId) return;
-      const wasRetry = retry > 0;
-      retry = 0; wsReady = true; lastPong = Date.now();
-      if (hbTimer) clearInterval(hbTimer);
-      hbTimer = setInterval(() => {
-        if (my !== connId || !ws || ws.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - lastPong > 75000) { try { ws.close(); } catch {} return; }
-        try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
-      }, 25000);
-      if (wasRetry) setTimeout(() => doRedraw(true), 150);
-    };
-    sock.onmessage = (e) => {
-      if (my !== connId) return;
-      if (typeof e.data === 'string') {
-        try { const m = JSON.parse(e.data); if (m && m.type === 'pong') { lastPong = Date.now(); return; } } catch {}
-        term.write(e.data);
-        return;
-      }
-      lastPong = Date.now();
-      term.write(new Uint8Array(e.data));
-    };
-    sock.onclose = () => {
-      if (my !== connId) return;
-      ws = null; wsReady = false;
-      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-      retry++;
-      const delay = Math.min(1000 * Math.pow(1.6, retry - 1), 15000);
-      retryTimer = setTimeout(() => { if (my === connId && current) openSocket(current); }, delay);
-    };
-    sock.onerror = () => {};
-  }
-
-  function reviveIfDead() {
-    if (current && pageTerm.classList.contains('active') &&
-        (!ws || ws.readyState === WebSocket.CLOSED)) {
-      retry = 0; openSocket(current);
-    }
-  }
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') { reviveIfDead(); syncViewport(); }
-  });
-  window.addEventListener('online', reviveIfDead);
-
-  async function doRedraw(silent) {
-    if (!current) return;
-    try { fit && fit.fit(); } catch {}
-    try { term && term.refresh(0, term.rows - 1); } catch {}
-    try { await fetch(`/redraw/${encodeURIComponent(current)}`, { method: 'POST' }); } catch {}
-    if (!silent) toast('已重绘');
-  }
 
   // ===================== sending ==========================================
   async function sendText() {
@@ -570,7 +761,7 @@
         b.onclick = () => {
           more.classList.toggle('open');
           b.textContent = more.classList.contains('open') ? '×' : '⋯';
-          scheduleFit();
+          keepBottom();
         };
       } else {
         b.onclick = () => {
@@ -592,25 +783,113 @@
     MORE_KEYS.forEach(s => more.appendChild(mk(s)));
   }
 
-  // ===================== composer =========================================
+  // ===================== slash commands ===================================
+  // Two kinds:
+  //  - no argument  -> send immediately
+  //  - takes an arg -> drop "/cmd " into the composer so you can type the rest
+  // Commands that open an interactive picker (/model, /resume without an id)
+  // still work: the panel appears in the terminal view and you drive it with
+  // the arrow keys + Enter in the key bar.
+  const SLASH = [
+    { group: '会话管理', items: [
+      { cmd: '/clear',    desc: '开启全新对话（旧对话可 /resume 找回）' },
+      { cmd: '/compact',  desc: '压缩上下文，腾出空间' },
+      { cmd: '/context',  desc: '查看上下文 token 分布' },
+      { cmd: '/todos',    desc: '显示当前待办清单' },
+      { cmd: '/cost',     desc: '显示本次会话花费' },
+    ]},
+    { group: 'Agent 控制', items: [
+      { cmd: '/goal',     desc: '持续工作直到达成条件', arg: '条件' },
+      { cmd: '/goal clear', desc: '结束当前目标' },
+      { cmd: '/plan',     desc: '查看当前计划内容' },
+      { cmd: '/btw',      desc: '插一句话问，不打断当前工作', arg: '问题' },
+    ]},
+    { group: '状态与切换', items: [
+      { cmd: '/status',   desc: '当前仓库与会话状态' },
+      { cmd: '/resume',   desc: '恢复之前的会话（面板选择）' },
+      { cmd: '/model',    desc: '查看或切换模型（面板选择）' },
+      { cmd: '/bashes',   desc: '列出后台任务' },
+    ]},
+  ];
+
+  const slashSheet = document.getElementById('slashSheet');
+
+  function buildSlash() {
+    const box = document.getElementById('slashList');
+    let html = '';
+    for (const g of SLASH) {
+      html += `<div class="slash-group">${esc(g.group)}</div>`;
+      for (const it of g.items) {
+        const arg = it.arg ? `<span class="arg">${esc(it.arg)}</span>` : '';
+        html += `<div class="slash-item" onclick="pickSlash('${esc(it.cmd)}',${it.arg ? 'true' : 'false'})">
+          <span class="cmd">${esc(it.cmd)}</span>${arg}
+          <span class="desc grow truncate">${esc(it.desc)}</span>
+        </div>`;
+      }
+    }
+    box.innerHTML = html;
+  }
+
+  function toggleSlash(e) {
+    if (e) e.stopPropagation();
+    slashSheet.classList.toggle('hidden');
+  }
+  function closeSlash() { slashSheet.classList.add('hidden'); }
+
+  async function pickSlash(cmd, needsArg) {
+    closeSlash();
+    if (needsArg) {
+      // Prefill and let the user finish the sentence.
+      inputEl.value = cmd + ' ';
+      autoGrow();
+      inputEl.focus();
+      return;
+    }
+    if (!current) return;
+    try {
+      const r = await fetch(`/m/send/${encodeURIComponent(current)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: cmd }),
+      });
+      toast(r.ok ? cmd : '发送失败');
+    } catch { toast('发送失败'); }
+  }
+
+
   function autoGrow() {
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
-    scheduleFit();
+    keepBottom();
   }
   inputEl.addEventListener('input', autoGrow);
   inputEl.addEventListener('focus', () => setTimeout(syncViewport, 150));
   inputEl.addEventListener('blur', () => setTimeout(syncViewport, 150));
 
   // ===================== status stream ====================================
+  let gotSnapshot = false;
   function connectEvents() {
     const es = new EventSource('/events');
     es.onmessage = (e) => {
       let d; try { d = JSON.parse(e.data); } catch { return; }
       if (d.type === 'snapshot') {
         Object.entries(d.statuses || {}).forEach(([n, i]) => { statusMap[n] = i; });
+        // On the FIRST snapshot, anything already finished predates this visit —
+        // treat it as seen so opening the page doesn't blink every session.
+        if (!gotSnapshot) {
+          gotSnapshot = true;
+          Object.entries(statusMap).forEach(([n, i]) => {
+            if (i && i.status === 'done') readDone[n] = i.updatedAt;
+          });
+          try { localStorage.setItem(READ_KEY, JSON.stringify(readDone)); } catch {}
+        }
       } else if (d.session) {
         statusMap[d.session] = { status: d.status, message: d.message, updatedAt: d.updatedAt };
+        // Finished while you're watching it => already seen, don't blink.
+        if (d.status === 'done' && d.session === current &&
+            pageTerm.classList.contains('active')) {
+          markRead(d.session);
+        }
       }
       if (pageList.classList.contains('active')) renderList();
       else updateHeader();
@@ -620,10 +899,24 @@
 
   // ===================== boot =============================================
   buildKeys();
+  buildSlash();
+  outEl.style.fontSize = fontSize + 'px';
+  applyWrap();
   syncViewport();
   refreshAll();
   connectEvents();
   setInterval(refreshAll, 10000);
+
+  // Don't poll a session the user can't see.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      syncViewport();
+      if (current && pageTerm.classList.contains('active')) startPolling();
+      refreshAll();
+    } else {
+      stopPolling();
+    }
+  });
   </script>
 </body>
 </html>

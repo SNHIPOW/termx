@@ -18,7 +18,13 @@ export function isStatus(v: unknown): v is Status {
 }
 
 export function setStatus(session: string, status: Status, message = ""): void {
-  const info: SessionStatus = { status, message, updatedAt: Date.now() };
+  // Idempotent for repeated same-status reports: reuse the existing updatedAt
+  // so the client's "already viewed" bookkeeping (readDone[name] === updatedAt)
+  // isn't invalidated by e.g. a follow-up idle_prompt Notification that repeats
+  // the 'done' state. Only a real transition to a new status bumps the timestamp.
+  const prev = store.get(session);
+  const updatedAt = prev && prev.status === status ? prev.updatedAt : Date.now();
+  const info: SessionStatus = { status, message, updatedAt };
   store.set(session, info);
   broadcast({ session, ...info });
 }

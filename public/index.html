@@ -31,8 +31,11 @@
     /* One xterm pane per session, stacked; only the active one is shown. Keeping
        them alive means switching sessions never resets/reconnects/redraws. */
     .term-pane { position: absolute; inset: 0; }
-    .term-pane.hidden-pane { visibility: hidden; z-index: 0; pointer-events: none; }
-    .term-pane.active-pane { visibility: visible; z-index: 1; }
+    /* Hidden panes stay RENDERED (opacity, not visibility:hidden) so the browser
+       keeps their WebGL draw buffer alive. visibility:hidden let the GPU discard
+       the buffer, which came back garbled on switch-back — the "来回切窗口乱码". */
+    .term-pane.hidden-pane { opacity: 0; z-index: 0; pointer-events: none; }
+    .term-pane.active-pane { opacity: 1; z-index: 1; }
     /* Scrollbar */
     #session-list-desktop::-webkit-scrollbar, #session-list-mobile::-webkit-scrollbar { width: 6px; }
     #session-list-desktop::-webkit-scrollbar-thumb, #session-list-mobile::-webkit-scrollbar-thumb {
@@ -68,6 +71,8 @@
     /* Child elements shouldn't become the drag/drop target — let events land on
        the card itself so dragstart/dragover/drop resolve consistently. */
     .session-item > * { pointer-events: none; }
+    /* The branch collapse chevron must stay clickable to fold sub-agents. */
+    .session-item > .branch-toggle { pointer-events: auto; }
     .pin-icon { color: var(--accent); opacity: 0.85; flex-shrink: 0; }
 
     /* Group / section header */
@@ -98,6 +103,21 @@
       background: transparent; border: 1px solid var(--accent); outline: none;
       color: inherit; padding: 0 4px; width: 100%; font: inherit; text-transform: none;
     }
+    /* Branch-Agent auto section (run-state tree) */
+    .branch-section-label {
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px 8px; margin: 4px 2px 3px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+      color: var(--accent);
+    }
+    .branch-item { position: relative; }
+    /* Collapse toggle chevron shown on a parent branch card. */
+    .branch-toggle {
+      flex: none; cursor: pointer; color: var(--fg-dim);
+      transition: transform 0.15s ease, color 0.12s ease;
+    }
+    .branch-toggle:hover { color: var(--fg); }
+    .branch-item.collapsed .branch-toggle { transform: rotate(-90deg); }
     .session-name-input {
       background: transparent;
       border: 1px solid #007acc;
@@ -177,6 +197,15 @@
     #theme-select:hover { border-color: var(--accent); }
     #theme-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
     #theme-select option { background: var(--bg-elev2); color: var(--fg); }
+    /* Redraw button click feedback: spin while working, flash on success. */
+    @keyframes termx-spin { to { transform: rotate(360deg); } }
+    #btn-redraw.busy { pointer-events: none; opacity: 0.75; }
+    /* lucide.createIcons() replaces the <i data-lucide> with an <svg>, so the
+       animation must target svg (i is kept as a fallback before icons render). */
+    #btn-redraw.busy > svg,
+    #btn-redraw.busy > i { animation: termx-spin 0.6s linear infinite; transform-origin: 50% 50%; }
+    #btn-redraw.done { background: var(--accent-soft); }
+    #btn-redraw:active { transform: scale(0.92); }
   </style>
 </head>
 <body>
@@ -189,6 +218,16 @@
         <span id="current-session-label" class="text-xs opacity-50 truncate hidden md:inline"></span>
       </div>
       <div class="flex items-center gap-2 md:gap-3">
+        <button id="btn-config" onclick="toggleConfigMenu(event)" title="导出/导入本地配置（分组、置顶、排序）"
+                class="h-10 w-10 md:h-7 md:w-7 rounded-md flex items-center justify-center transition-all hover:bg-white/10 shrink-0"
+                style="color: var(--accent)">
+          <i data-lucide="settings" class="w-4 h-4"></i>
+        </button>
+        <button id="btn-redraw" onclick="redrawSession()" title="重绘当前终端 (修复乱码)"
+                class="h-10 w-10 md:h-7 md:w-7 rounded-md flex items-center justify-center transition-all hover:bg-white/10 shrink-0"
+                style="color: var(--accent)">
+          <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+        </button>
         <select id="theme-select" class="h-10 md:h-7 text-xs md:text-sm rounded-md pl-3 pr-9 cursor-pointer appearance-none bg-no-repeat" style="background-image: url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23888888' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E&quot;); background-position: right 10px center;"></select>
       </div>
     </header>
@@ -274,6 +313,20 @@
     <button onclick="deleteSession()" class="w-full px-4 py-2 text-sm text-left hover:opacity-80 flex items-center gap-2 text-red-400">
       <i data-lucide="trash-2" class="w-4 h-4"></i>
       Delete
+    </button>
+  </div>
+
+  <!-- Local config export/import. localStorage is per-origin, so switching the
+       URL (localhost vs LAN IP vs tunnel) hides your groups/pins/order. This
+       lets you carry them across origins. -->
+  <div id="config-menu" class="fixed hidden rounded-lg py-1 min-w-[230px] z-50 shadow-xl" style="background: var(--bg-elev); border: 1px solid var(--border)">
+    <button onclick="exportConfig()" class="w-full px-4 py-2 text-sm text-left hover:opacity-80 flex items-center gap-2">
+      <i data-lucide="download" class="w-4 h-4"></i>
+      导出配置（复制到剪贴板）
+    </button>
+    <button onclick="importConfig()" class="w-full px-4 py-2 text-sm text-left hover:opacity-80 flex items-center gap-2">
+      <i data-lucide="upload" class="w-4 h-4"></i>
+      导入配置（粘贴）
     </button>
   </div>
 
@@ -367,8 +420,64 @@
       return new Terminal({ cursorBlink: true, scrollback: 5000, theme: themes[savedTheme] || themes['Dark'], allowProposedApi: true, macOptionClickForcesSelection: true, macOptionIsMeta: false, altClickMovesCursor: false, rightClickSelectsWord: true });
     }
 
-    // Create (once) a pane for `session`: its own xterm, WebGL renderer, and a
-    // persistent WebSocket that keeps receiving output in the background.
+    // --- WebGL renderer LRU ---------------------------------------------------
+    // A browser allows only a handful of live WebGL contexts (~8-16). With one
+    // pane per session and many sessions, giving EVERY pane a WebGL renderer
+    // blows past that limit; the browser then evicts contexts at random, causing
+    // frequent 乱码. So we keep WebGL only on the few most-recently-active panes
+    // (DOM renderer for the rest) — the visible terminal always has GPU, the
+    // hidden ones don't need it. This caps live contexts and kills the churn.
+    const MAX_WEBGL = 3;
+    const webglLRU = []; // session names holding a WebGL renderer, MRU last
+
+    function detachWebgl(session) {
+      const p = panes.get(session);
+      if (!p) return;
+      const i = webglLRU.indexOf(session);
+      if (i >= 0) webglLRU.splice(i, 1);
+      if (p.webgl) {
+        try { p.webgl.dispose(); } catch {}
+        p.webgl = null;
+        // Fall back to DOM renderer cleanly.
+        try { p.term.clearTextureAtlas && p.term.clearTextureAtlas(); } catch {}
+        try { p.term.refresh(0, p.term.rows - 1); } catch {}
+      }
+    }
+
+    // Master switch for the GPU renderer. Set localStorage 'termx-webgl' to '0'
+    // to force the DOM renderer everywhere (diagnostic / fallback for machines
+    // where WebGL is the source of 乱码). Default ON.
+    const WEBGL_ENABLED = localStorage.getItem('termx-webgl') !== '0';
+
+    function attachWebgl(session) {
+      if (!WEBGL_ENABLED) return;
+      const p = panes.get(session);
+      if (!p || !window.WebglAddon) return;
+      // Already has it — just bump to MRU.
+      if (p.webgl) {
+        const i = webglLRU.indexOf(session);
+        if (i >= 0) webglLRU.splice(i, 1);
+        webglLRU.push(session);
+        return;
+      }
+      // Evict least-recently-used until under the cap.
+      while (webglLRU.length >= MAX_WEBGL) {
+        const victim = webglLRU.shift();
+        if (victim && victim !== session) detachWebgl(victim);
+        else break;
+      }
+      try {
+        const w = new WebglAddon.WebglAddon();
+        w.onContextLoss(() => onGlContextLost(session));
+        p.term.loadAddon(w);
+        p.webgl = w;
+        webglLRU.push(session);
+      } catch (e) { console.warn('WebGL attach failed, staying on DOM renderer', e); }
+    }
+
+    // Create (once) a pane for `session`: its own xterm + a persistent WebSocket
+    // that keeps receiving output in the background. WebGL is attached lazily
+    // (only when the pane becomes active) via attachWebgl().
     function ensurePane(session) {
       let p = panes.get(session);
       if (p) return p;
@@ -382,17 +491,9 @@
       const fit = new FitAddon.FitAddon();
       term.loadAddon(fit);
       term.open(el);
-      let webgl = null;
-      try {
-        if (window.WebglAddon) {
-          webgl = new WebglAddon.WebglAddon();
-          webgl.onContextLoss(() => { try { webgl.dispose(); } catch {} });
-          term.loadAddon(webgl);
-        }
-      } catch (e) { console.warn('WebGL renderer unavailable, using DOM renderer', e); }
       fit.fit();
 
-      p = { term, fit, webgl, ws: null, wsReady: false, el, connId: 0 };
+      p = { term, fit, webgl: null, ws: null, wsReady: false, el, connId: 0, hbTimer: null, retryTimer: null, retry: 0, lastPong: 0, sentCols: 0, sentRows: 0 };
       panes.set(session, p);
 
       // Send user keystrokes to this pane's socket.
@@ -407,30 +508,120 @@
       p.connId = myConn;
       p.wsReady = false;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${location.host}/ws/${session}?resize=${p.term.cols},${p.term.rows}`);
+      // Only advertise a size if fit() produced a plausible one. A pane created
+      // while the layout hasn't settled can report a tiny default (e.g. 80x24);
+      // sending that would resize the real tmux session and garble it (and, with
+      // multiple clients, every other window too). Omitting the param lets the
+      // server keep the session's existing size.
+      const okSize = p.term.cols >= 20 && p.term.rows >= 5;
+      const q = okSize ? `?resize=${p.term.cols},${p.term.rows}` : '';
+      // The size in the connect URL is what the server starts with, so remember
+      // it as "already sent" — avoids a redundant resize (and redraw) right after.
+      if (okSize) { p.sentCols = p.term.cols; p.sentRows = p.term.rows; }
+      const ws = new WebSocket(`${proto}//${location.host}/ws/${encodeURIComponent(session)}${q}`);
       ws.binaryType = 'arraybuffer';
       p.ws = ws;
+
+      const stopHeartbeat = () => {
+        if (p.hbTimer) { clearInterval(p.hbTimer); p.hbTimer = null; }
+      };
+
       ws.onopen = () => {
         if (p.connId !== myConn) return;
+        const wasReconnect = p.retry > 0; // a fresh pane has retry===0
+        p.retry = 0; // successful connect resets the backoff
         setTimeout(() => {
           if (p.connId === myConn) { p.wsReady = true; if (session === currentSession) p.term.focus(); }
         }, 50);
+        // After a RECONNECT the on-screen buffer may be stale/misaligned vs the
+        // real tmux state. Auto-repaint + ask tmux for a clean frame so the user
+        // never has to hit the redraw button after a dropout.
+        if (wasReconnect) {
+          setTimeout(() => repaintPane(session, { rebuildGl: false, askTmux: true }), 120);
+        }
+        // Heartbeat: keeps idle proxies/tunnels from silently dropping the
+        // socket, and detects a half-open connection (no pong -> force reconnect).
+        stopHeartbeat();
+        p.lastPong = Date.now();
+        p.hbTimer = setInterval(() => {
+          if (p.connId !== myConn || !p.ws || p.ws.readyState !== WebSocket.OPEN) return;
+          // No pong for a while => the link is dead even though onclose never fired.
+          if (Date.now() - p.lastPong > 75000) {
+            try { p.ws.close(); } catch {}   // triggers onclose -> reconnect
+            return;
+          }
+          try { p.ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+        }, 25000);
       };
+
       ws.onmessage = (e) => {
         if (p.connId !== myConn) return;
-        p.term.write(e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : e.data);
+        if (typeof e.data === 'string') {
+          // Control frames (pong) are JSON; anything else is terminal output.
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg && msg.type === 'pong') { p.lastPong = Date.now(); return; }
+          } catch {}
+          p.term.write(e.data);
+          return;
+        }
+        p.lastPong = Date.now(); // any traffic proves the link is alive
+        p.term.write(new Uint8Array(e.data));
       };
+
       ws.onclose = () => {
-        if (p.connId === myConn) { p.ws = null; p.wsReady = false; }
+        if (p.connId !== myConn) return;
+        p.ws = null;
+        p.wsReady = false;
+        stopHeartbeat();
+        // Auto-reconnect with backoff. Without this, a socket dropped while you
+        // were away leaves the terminal permanently frozen until a page refresh.
+        p.retry = (p.retry || 0) + 1;
+        const delay = Math.min(1000 * Math.pow(1.6, p.retry - 1), 15000);
+        p.retryTimer = setTimeout(() => {
+          if (p.connId !== myConn) return;   // pane was destroyed/replaced
+          if (!panes.has(session)) return;
+          openSocket(session, p);
+        }, delay);
       };
-      ws.onerror = (err) => console.error('WebSocket error:', err);
+
+      ws.onerror = () => { /* onclose follows; reconnect is handled there */ };
     }
+
+    // Reconnect any pane whose socket died while the tab was hidden/asleep.
+    function reviveDeadSockets() {
+      panes.forEach((p, session) => {
+        if (!p.ws || p.ws.readyState === WebSocket.CLOSED) {
+          if (p.retryTimer) { clearTimeout(p.retryTimer); p.retryTimer = null; }
+          p.retry = 0;
+          openSocket(session, p);
+        }
+      });
+    }
+    // Coming back to the tab (or regaining network) is the moment to check.
+    // Backgrounded tabs often lose the GPU/WebGL context, so also repaint the
+    // visible pane when we return — that's the classic "回来一看是乱码" case.
+    function onTabActive() {
+      reviveDeadSockets();
+      if (currentSession && panes.has(currentSession)) {
+        requestAnimationFrame(() => repaintPane(currentSession, { rebuildGl: false, askTmux: false }));
+      }
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') onTabActive();
+    });
+    window.addEventListener('online', onTabActive);
+    window.addEventListener('focus', onTabActive);
 
     function destroyPane(session) {
       const p = panes.get(session);
       if (!p) return;
-      p.connId = -1; // invalidate callbacks
+      p.connId = -1; // invalidate callbacks (also stops the reconnect loop)
+      if (p.hbTimer) { clearInterval(p.hbTimer); p.hbTimer = null; }
+      if (p.retryTimer) { clearTimeout(p.retryTimer); p.retryTimer = null; }
       try { if (p.ws) { p.ws.onclose = p.ws.onmessage = p.ws.onopen = p.ws.onerror = null; p.ws.close(); } } catch {}
+      const li = webglLRU.indexOf(session);
+      if (li >= 0) webglLRU.splice(li, 1);
       try { if (p.webgl) p.webgl.dispose(); } catch {}
       try { p.term.dispose(); } catch {}
       try { p.el.remove(); } catch {}
@@ -516,6 +707,48 @@
     let groups = JSON.parse(localStorage.getItem('termx-groups') || '[]');            // [{id, name, collapsed}]
     let sessionGroup = JSON.parse(localStorage.getItem('termx-session-group') || '{}'); // name -> groupId
     const PINNED_KEY = '__pinned__', UNGROUPED_KEY = '__ungrouped__';
+
+    // --- Branch-agent session tree (auto, from server /branches) ---
+    // [{name, parent}] — name is a real tmux session, parent is its parent tmux
+    // session name (or null for a root). Hierarchy is by session, not folders.
+    let branchNodes = [];
+    // Collapsed parent branch cards, keyed by parent session name. Persisted so
+    // a parent can keep its sub-agents folded across refreshes.
+    let branchCollapsed = JSON.parse(localStorage.getItem('termx-branch-collapsed') || '{}');
+    function persistBranchCollapsed() { localStorage.setItem('termx-branch-collapsed', JSON.stringify(branchCollapsed)); }
+    function toggleBranchCollapse(name) {
+      branchCollapsed[name] = !branchCollapsed[name];
+      persistBranchCollapsed();
+      renderSessions();
+    }
+
+    // Manual sibling order within the branch tree: { parentKey: [childName,...] }.
+    // parentKey is the parent session name, or '__root__' for top-level branches.
+    // Only records user-dragged order; unlisted siblings keep their natural order.
+    let branchOrder = JSON.parse(localStorage.getItem('termx-branch-order') || '{}');
+    function persistBranchOrder() { localStorage.setItem('termx-branch-order', JSON.stringify(branchOrder)); }
+    const BRANCH_ROOT_KEY = '__root__';
+
+    // Reorder a branch under its parent: move `dragged` to before/after `target`.
+    // Rejected if they don't share the same parent (siblings only).
+    function moveBranch(dragged, target, after, parentKey) {
+      const key = parentKey || BRANCH_ROOT_KEY;
+      // Current sibling order = existing saved order (filtered) then any new ones,
+      // rebuilt from the live tree so it stays in sync.
+      const siblings = currentBranchSiblings(key);
+      const from = siblings.indexOf(dragged);
+      let to = siblings.indexOf(target);
+      if (from < 0 || to < 0 || from === to) return;
+      siblings.splice(from, 1);
+      to = siblings.indexOf(target);
+      siblings.splice(after ? to + 1 : to, 0, dragged);
+      branchOrder[key] = siblings;
+      persistBranchOrder();
+      renderSessions();
+    }
+    // Live sibling names under a parentKey, in current display order.
+    let _branchSiblingCache = {};
+    function currentBranchSiblings(key) { return (_branchSiblingCache[key] || []).slice(); }
 
     function persistPinned()  { localStorage.setItem('termx-pinned', JSON.stringify(pinned)); }
     function persistGroups()  { localStorage.setItem('termx-groups', JSON.stringify(groups)); }
@@ -611,7 +844,7 @@
 
     // Render a single session card. `groupKey` is the drop-zone this card lives in
     // (PINNED_KEY / UNGROUPED_KEY / groupId) so drag&drop can infer membership.
-    function cardHtml(s, groupKey) {
+    function cardHtml(s, groupKey, depth = 0, hasChildren = false, collapsed = false, branchParent = '') {
       const safe = escapeHtml(s.name);
       const active = s.name === currentSession ? ' active' : '';
       const st = statusOf(s.name);
@@ -619,13 +852,25 @@
       const jsName = jsAttr(s.name); // safe for a single-quoted JS string inside an HTML attribute
       const pin = isPinned(s.name)
         ? `<i data-lucide="pin" class="pin-icon w-3.5 h-3.5"></i>` : '';
+      // Branch cards live in the branch tree. They ARE draggable, but only for
+      // reordering siblings under the same parent (see wireDrag). data-branch-parent
+      // records their parent session so cross-parent drops can be rejected.
+      const branch = groupKey === '__branch__';
+      const indent = depth > 0 ? ` style="padding-left:${12 + depth * 16}px"` : '';
+      // A parent branch card gets a collapse chevron to fold/unfold its sub-agents.
+      const toggle = hasChildren
+        ? `<i data-lucide="chevron-down" class="branch-toggle w-3.5 h-3.5"
+             onclick="event.stopPropagation(); toggleBranchCollapse('${jsName}')"></i>`
+        : '';
+      const branchAttrs = branch ? ` data-branch-parent="${escapeHtml(branchParent)}"` : '';
       return `
-        <div class="session-item flex items-center gap-2.5 px-3 py-2 cursor-pointer${active}"
+        <div class="session-item flex items-center gap-2.5 px-3 py-2 cursor-pointer${active}${branch ? ' branch-item' : ''}${collapsed ? ' collapsed' : ''}"
              draggable="true"
              data-session="${safe}"
-             data-group="${groupKey}"
+             data-group="${groupKey}"${indent}${branchAttrs}
              onclick="connectByName('${jsName}'); if(window.innerWidth < 768) toggleMobilePanel();"
              oncontextmenu="showContextMenuByName(event, '${jsName}')">
+          ${toggle}
           <span class="${dotClass(s.name)}" title="${STATUS_LABEL[st] || st}"></span>
           <span class="session-name text-sm truncate flex-1" title="${stMsg}">${safe}</span>
           ${pin}
@@ -648,13 +893,87 @@
         </div>`;
     }
 
+    // Header for an intermediate branch-tree level (task / orchestration node
+    // that has no tmux session of its own). Not connectable; click toggles collapse.
+    // Build the set of tmux session names placed by the branch tree (any node
+    // whose tmux name matches a live session). Excluded from manual grouping.
+    function branchPlacedNames() {
+      const active = new Set(sessions.map(s => s.name));
+      const placed = new Set();
+      for (const n of branchNodes) if (active.has(n.name)) placed.add(n.name);
+      return placed;
+    }
+
+    // Render the Branch-Agent section as a SESSION tree (no folders): each node
+    // is a real tmux window, children indented under their parent session. The
+    // parent link comes from each STATUS.md's "父任务" (由 X 发起). Only nodes
+    // matching a live tmux session are shown; dead branches are skipped.
+    function renderBranchSection() {
+      if (!branchNodes.length) return '';
+      const active = new Map(sessions.map(s => [s.name, s]));
+
+      // Only keep nodes whose tmux session is actually alive.
+      const liveNodes = branchNodes.filter(n => active.has(n.name));
+      if (!liveNodes.length) return '';
+
+      const nodeByName = new Map(liveNodes.map(n => [n.name, n]));
+      // children[parentName] = [childName, ...]; roots = parent missing/not live.
+      const children = new Map();
+      const roots = [];
+      for (const n of liveNodes) {
+        const hasLiveParent = n.parent && nodeByName.has(n.parent);
+        if (hasLiveParent) {
+          if (!children.has(n.parent)) children.set(n.parent, []);
+          children.get(n.parent).push(n.name);
+        } else {
+          roots.push(n.name); // root: no parent, or parent isn't a live session
+        }
+      }
+
+      // Apply the user's saved sibling order (drag-reorder). Names in the saved
+      // list come first (in that order); any siblings not yet listed keep their
+      // natural order at the end. Also refresh the sibling cache used by drag.
+      const orderSiblings = (list, key) => {
+        const saved = branchOrder[key] || [];
+        const set = new Set(list);
+        const ordered = saved.filter(n => set.has(n)).concat(list.filter(n => !saved.includes(n)));
+        _branchSiblingCache[key] = ordered;
+        return ordered;
+      };
+
+      _branchSiblingCache = {};
+      const orderedRoots = orderSiblings(roots, BRANCH_ROOT_KEY);
+
+      let out = '';
+      const seen = new Set();
+      const walk = (name, depth, parentKey) => {
+        if (seen.has(name)) return; // guard against cycles
+        seen.add(name);
+        const kids = children.get(name) || [];
+        const collapsed = !!branchCollapsed[name] && kids.length > 0;
+        out += cardHtml(active.get(name), '__branch__', depth, kids.length > 0, collapsed, parentKey === BRANCH_ROOT_KEY ? '' : parentKey);
+        if (!collapsed) {
+          for (const childName of orderSiblings(kids, name)) walk(childName, depth + 1, name);
+        }
+      };
+      orderedRoots.forEach(r => walk(r, 0, BRANCH_ROOT_KEY));
+      if (!out) return '';
+      return `<div class="branch-section-label">分支 Agent</div>` + out;
+    }
+
     function renderSessions() {
-      const visible = sessions.filter(s => !HIDDEN_SESSIONS.has(s.name));
+      const branchPlaced = branchPlacedNames();
+      // Sessions placed by the branch tree are excluded from the manual sections
+      // so they aren't shown twice.
+      const visible = sessions.filter(s => !HIDDEN_SESSIONS.has(s.name) && !branchPlaced.has(s.name));
 
       const pinnedItems = visible.filter(s => isPinned(s.name));
       const pinnedCollapsed = localStorage.getItem('termx-pinned-collapsed') === '1';
 
       let html = '';
+
+      // 0) Branch-Agent section (auto, from run-state tree) — always on top.
+      html += renderBranchSection();
 
       // 1) Pinned section
       if (pinnedItems.length) {
@@ -774,13 +1093,32 @@
         clearDropHints(container);
         dragName = null;
       });
+      // Is the currently-dragged card a branch card? If so, drag is constrained
+      // to reordering siblings under the same parent.
+      const draggedBranchParent = () => {
+        const el = container.querySelector(`.session-item.branch-item[data-session="${CSS.escape(dragName)}"]`)
+          || document.querySelector(`.session-item.branch-item[data-session="${CSS.escape(dragName)}"]`);
+        return el ? el.dataset.branchParent : null; // null => not a branch card
+      };
       container.addEventListener('dragover', (e) => {
         if (!dragName) return;
         e.preventDefault();
         clearDropHints(container);
-        const header = e.target.closest('.group-header');
+        const bp = draggedBranchParent();
+        if (bp !== null) {
+          // Branch card: only a same-parent branch sibling is a valid drop target.
+          const item = e.target.closest('.session-item.branch-item');
+          if (!item || item.dataset.session === dragName || item.dataset.branchParent !== bp) return;
+          const r = item.getBoundingClientRect();
+          const after = (e.clientY - r.top) > r.height / 2;
+          item.classList.add(after ? 'drop-after' : 'drop-before');
+          e.dataTransfer.dropEffect = 'move';
+          return;
+        }
+        // Manual (non-branch) card: original behavior; branch cards not targets.
+        const header = e.target.closest('.group-header:not(.branch-header)');
         if (header) { header.classList.add('drop-into'); e.dataTransfer.dropEffect = 'move'; return; }
-        const item = e.target.closest('.session-item');
+        const item = e.target.closest('.session-item:not(.branch-item)');
         if (!item || item.dataset.session === dragName) return;
         const r = item.getBoundingClientRect();
         const after = (e.clientY - r.top) > r.height / 2;
@@ -791,18 +1129,40 @@
         e.preventDefault();
         if (!dragName) return;
         clearDropHints(container);
-        const header = e.target.closest('.group-header');
+        const bp = draggedBranchParent();
+        if (bp !== null) {
+          // Reorder within the same parent's siblings only.
+          const item = e.target.closest('.session-item.branch-item');
+          if (!item || item.dataset.branchParent !== bp) return;
+          const r = item.getBoundingClientRect();
+          const after = (e.clientY - r.top) > r.height / 2;
+          moveBranch(dragName, item.dataset.session, after, bp || BRANCH_ROOT_KEY);
+          return;
+        }
+        const header = e.target.closest('.group-header:not(.branch-header)');
         if (header) {
           // Drop onto a header: join that zone, placed at the end of the section.
           moveSession(dragName, null, true, header.dataset.groupHeader);
           return;
         }
-        const item = e.target.closest('.session-item');
+        const item = e.target.closest('.session-item:not(.branch-item)');
         if (!item) return;
         const r = item.getBoundingClientRect();
         const after = (e.clientY - r.top) > r.height / 2;
         moveSession(dragName, item.dataset.session, after);
       });
+    }
+
+    async function refreshBranches() {
+      try {
+        const res = await fetch('/branches');
+        const next = await res.json();
+        // Only re-render if the tree actually changed (avoid churn every 3s).
+        if (JSON.stringify(next) !== JSON.stringify(branchNodes)) {
+          branchNodes = next;
+          renderSessions();
+        }
+      } catch { /* keep last known tree */ }
     }
 
     function connectByName(name) { if (sessions.some(s => s.name === name)) connect(name); }
@@ -878,6 +1238,107 @@
       renderSessions();
     }
 
+    // Core repaint for a pane. rebuildGl=true recreates the WebGL renderer (for a
+    // lost/glitched GPU context, which won't self-heal); askTmux=true asks tmux to
+    // re-emit a clean frame. Used by both the manual button and the automatic
+    // triggers below. Never resets scrollback or the socket.
+    async function repaintPane(name, { rebuildGl = false, askTmux = false } = {}) {
+      const p = panes.get(name);
+      if (!p) return;
+      if (rebuildGl) {
+        // Route through the LRU so we never exceed the WebGL context cap.
+        detachWebgl(name);
+        attachWebgl(name);
+      }
+      try { p.term.clearTextureAtlas && p.term.clearTextureAtlas(); } catch {}
+      try { p.fit.fit(); } catch {}
+      try { p.term.refresh(0, p.term.rows - 1); } catch {}
+      if (askTmux) {
+        try { await fetch(`/redraw/${encodeURIComponent(name)}`, { method: 'POST' }); } catch {}
+      }
+    }
+
+    // WebGL context loss handler: the GPU dropped our renderer. Drop it from the
+    // LRU and repaint on DOM; only the currently-visible pane re-attaches WebGL.
+    function onGlContextLost(name) {
+      detachWebgl(name);
+      requestAnimationFrame(() => {
+        if (name === currentSession) repaintPane(name, { rebuildGl: true, askTmux: true });
+        else repaintPane(name, { rebuildGl: false, askTmux: false });
+      });
+    }
+
+    // Manual toolbar redraw: repaint the visible terminal with spinner feedback.
+    async function redrawSession() {
+      const name = currentSession;
+      const btn = document.getElementById('btn-redraw');
+      if (!name) return;
+      if (btn) { btn.classList.remove('done'); btn.classList.add('busy'); }
+      // Yield so the browser paints the spinner before the synchronous work below.
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await repaintPane(name, { rebuildGl: true, askTmux: true });
+      setTimeout(() => {
+        if (!btn) return;
+        btn.classList.remove('busy');
+        btn.classList.add('done');
+        setTimeout(() => btn.classList.remove('done'), 500);
+      }, 350);
+      const p = panes.get(name);
+      if (p) p.term.focus();
+    }
+
+    // --- Local config export/import ------------------------------------------
+    // localStorage is scoped per origin, so reaching termx via a different URL
+    // (localhost / LAN IP / tunnel) shows an empty sidebar even though nothing
+    // was lost. These let you carry the local state between origins.
+    const CONFIG_KEYS = [
+      'terminal-theme', 'termx-groups', 'termx-session-group', 'termx-pinned',
+      'termx-pinned-collapsed', 'termx-session-order', 'termx-sidebar-w',
+      'termx-branch-collapsed', 'termx-branch-order', 'termx-read-done',
+    ];
+    const configMenu = document.getElementById('config-menu');
+
+    function toggleConfigMenu(e) {
+      e.stopPropagation();
+      const btn = document.getElementById('btn-config');
+      const r = btn.getBoundingClientRect();
+      configMenu.style.left = Math.min(r.left, window.innerWidth - 250) + 'px';
+      configMenu.style.top = (r.bottom + 6) + 'px';
+      configMenu.classList.toggle('hidden');
+    }
+
+    function exportConfig() {
+      configMenu.classList.add('hidden');
+      const dump = {};
+      for (const k of CONFIG_KEYS) {
+        const v = localStorage.getItem(k);
+        if (v != null) dump[k] = v;
+      }
+      const text = JSON.stringify(dump);
+      const done = () => alert('配置已复制到剪贴板。\n到新地址打开 termx → 设置 → 导入配置 → 粘贴。');
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(done, () => prompt('复制下面的配置：', text));
+      } else {
+        // http:// origins have no clipboard API — fall back to a selectable prompt.
+        prompt('复制下面的配置：', text);
+      }
+    }
+
+    function importConfig() {
+      configMenu.classList.add('hidden');
+      const text = prompt('粘贴之前导出的配置：');
+      if (!text) return;
+      let dump;
+      try { dump = JSON.parse(text); } catch { alert('配置格式不对，导入取消。'); return; }
+      if (!dump || typeof dump !== 'object') { alert('配置格式不对，导入取消。'); return; }
+      let n = 0;
+      for (const k of CONFIG_KEYS) {
+        if (typeof dump[k] === 'string') { localStorage.setItem(k, dump[k]); n++; }
+      }
+      alert(`已导入 ${n} 项配置，页面将刷新。`);
+      location.reload();
+    }
+
     function ungroupSession() {
       contextMenu.classList.add('hidden');
       const name = contextMenuTarget;
@@ -915,24 +1376,35 @@
       renderSessions();
     }
 
-    document.addEventListener('click', () => contextMenu.classList.add('hidden'));
+    document.addEventListener('click', () => {
+      contextMenu.classList.add('hidden');
+      configMenu.classList.add('hidden');
+    });
 
     function renameSession() {
       if (!contextMenuTarget) return;
       contextMenu.classList.add('hidden');
-      const item = document.querySelector(`[data-session="${contextMenuTarget}"]`);
+      const item = document.querySelector(`[data-session="${CSS.escape(contextMenuTarget)}"]`);
       if (!item) return;
       const nameSpan = item.querySelector('.session-name');
       const oldName = contextMenuTarget;
-      nameSpan.innerHTML = `<input type="text" class="session-name-input" value="${oldName}">`;
-      const input = nameSpan.querySelector('input');
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'session-name-input';
+      input.value = oldName;
+      nameSpan.innerHTML = '';
+      nameSpan.appendChild(input);
       input.focus();
       input.select();
 
+      // Guard so blur + Enter don't both fire finishRename (double PATCH / races).
+      let done = false;
       const finishRename = async () => {
+        if (done) return;
+        done = true;
         const newName = input.value.trim();
         if (newName && newName !== oldName) {
-          await fetch(`/sessions/${oldName}`, {
+          await fetch(`/sessions/${encodeURIComponent(oldName)}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name: newName })
@@ -946,11 +1418,15 @@
           nameSpan.textContent = oldName;
         }
       };
+      const cancel = () => { if (!done) { done = true; nameSpan.textContent = oldName; } };
 
       input.addEventListener('blur', finishRename);
       input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') input.blur();
-        else if (e.key === 'Escape') nameSpan.textContent = oldName;
+        // Stop the keypress from reaching the xterm/global handlers, which can
+        // swallow Enter so it never confirms the rename.
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
       });
     }
 
@@ -979,6 +1455,9 @@
       markRead(session);
 
       const p = ensurePane(session);
+      // Give the now-active pane a WebGL renderer (evicting an old one if needed).
+      // Only the visible terminal needs GPU, so live contexts stay under the cap.
+      attachWebgl(session);
       // Toggle pane visibility.
       panes.forEach((pp, name) => {
         const active = name === session;
@@ -987,12 +1466,20 @@
       });
 
       if (prev !== session) renderSessions();
-      // Re-fit and focus the now-visible pane (it may have been resized while hidden).
+      // Re-fit and repaint (clear atlas + full refresh) the now-visible pane so
+      // switching windows never shows a stale/garbled frame.
       requestAnimationFrame(() => {
         try { p.fit.fit(); } catch {}
-        if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+        // Only tell tmux to resize if the grid actually changed for this pane —
+        // an unconditional resize on every switch forces a full-screen redraw.
+        if (p.ws && p.ws.readyState === WebSocket.OPEN &&
+            (p.term.cols !== p.sentCols || p.term.rows !== p.sentRows)) {
+          p.sentCols = p.term.cols;
+          p.sentRows = p.term.rows;
           p.ws.send(JSON.stringify({ type: 'resize', cols: p.term.cols, rows: p.term.rows }));
         }
+        try { p.term.clearTextureAtlas && p.term.clearTextureAtlas(); } catch {}
+        try { p.term.refresh(0, p.term.rows - 1); } catch {}
         p.term.focus();
       });
     }
@@ -1007,9 +1494,26 @@
         if (!p) return;
         try { p.fit.fit(); } catch {}
         clearTimeout(resizeTimeout);
+        // Debounce longer AND require the size to be STABLE before committing.
+        // fit() can oscillate between e.g. 43/44 rows when the container height
+        // isn't an exact multiple of the cell height (sub-pixel / scrollbar
+        // jitter). Each flip is a "real" change, so plain dedupe still lets it
+        // through and tmux does a full-screen redraw ("刷屏"). We only send once
+        // the fitted size has held steady for the debounce window.
         resizeTimeout = setTimeout(() => {
-          if (p.ws && p.ws.readyState === WebSocket.OPEN) p.ws.send(JSON.stringify({ type: 'resize', cols: p.term.cols, rows: p.term.rows }));
-        }, 100);
+          if (!p.ws || p.ws.readyState !== WebSocket.OPEN) return;
+          const c = p.term.cols, r = p.term.rows;
+          // Confirm it's still the same one frame later (guards against a flip
+          // that lands exactly on the timer boundary).
+          requestAnimationFrame(() => {
+            if (p.term.cols !== c || p.term.rows !== r) return; // still moving
+            if (c === p.sentCols && r === p.sentRows) return;   // no real change
+            p.sentCols = c; p.sentRows = r;
+            if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+              p.ws.send(JSON.stringify({ type: 'resize', cols: c, rows: r }));
+            }
+          });
+        }, 250);
       });
     }
 
@@ -1047,6 +1551,13 @@
 
     function applyStatus(name, info) {
       statusMap[name] = info;
+      // If a 'done' arrives for the session the user is CURRENTLY viewing, they
+      // watched it finish — auto-mark it read so it never blinks white (not on
+      // switch-away, not on refresh). Only 'done' for other sessions blinks.
+      if (info && info.status === 'done' && name === currentSession) {
+        readDone[name] = info.updatedAt;
+        localStorage.setItem('termx-read-done', JSON.stringify(readDone));
+      }
       // If this session isn't rendered yet, refresh the list; otherwise patch the dot.
       if (document.querySelector(`.session-item[data-session="${CSS.escape(name)}"]`)) {
         updateDot(name);
@@ -1148,6 +1659,8 @@
 
     refreshSessions();
     connectEvents();
+    refreshBranches();
+    setInterval(refreshBranches, 3000);
   </script>
 </body>
 </html>

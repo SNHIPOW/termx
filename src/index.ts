@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { join } from "path";
 import { homedir } from "os";
+import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
@@ -59,6 +60,118 @@ app.get("/sessions", async (c) => {
   return c.json(withStatus);
 });
 
+// --- branch-agent session hierarchy ---------------------------------------
+// The branch-agent-mechanism records each branch as a STATUS.md under
+// ~/.codebuddy/run-state/. What matters here is NOT the directory layout but
+// the SESSION parent/child relationship recorded in each STATUS.md's
+// "## 分支身份" table:
+//   分支 | 父任务 | 当前状态 | session | tmux | 更新于
+//   - tmux  column: this branch's real tmux session name.
+//   - 父任务 column: "由 <X> 发起（...）" — X is the PARENT tmux session name.
+//                     "由人主会话发起" / "由人发起" means this is a root.
+// We build a tmux-session tree from (tmux -> parent tmux), ignoring directories
+// entirely. Each node is a real session window; there are no folder levels.
+interface BranchNode {
+  name: string; // this branch's real tmux session name
+  parent: string | null; // parent tmux session name, or null if a root
+}
+
+const RUN_STATE_ROOT = join(homedir(), ".codebuddy", "run-state");
+let branchCache: { at: number; nodes: BranchNode[] } | null = null;
+const BRANCH_TTL_MS = 3000;
+
+// A tmux cell may carry trailing prose, e.g. "main（主会话直连、无独立 tmux）".
+// Take the leading token before any whitespace or CJK/ASCII bracket.
+function cleanSessionName(raw: string): string {
+  return raw.split(/[（(【\[\s]/)[0].trim();
+}
+
+// Extract the parent tmux name from a "父任务" cell like "由 X 发起（...）".
+// Returns null for human/root origins ("由人主会话发起", "由人发起", empty, ...).
+function parseParent(raw: string): string | null {
+  if (!raw) return null;
+  const m = raw.match(/由\s*([^\s（(【\[发]+)\s*发起/);
+  if (!m) return null;
+  const who = m[1].trim();
+  if (!who || who.includes("人")) return null; // human-originated => root
+  return who;
+}
+
+// Parse the "## 分支身份" table's first data row. Tolerant of column order by
+// matching the header row. Returns {} if the section/table isn't found.
+function parseIdentity(md: string): { tmux?: string; parent?: string } {
+  const secIdx = md.indexOf("## 分支身份");
+  if (secIdx === -1) return {};
+  const rest = md.slice(secIdx).split("\n");
+  let headerCols: string[] | null = null;
+  for (let i = 1; i < rest.length; i++) {
+    const line = rest[i];
+    if (line.startsWith("## ") && i > 1) break; // next section
+    if (!line.includes("|")) continue;
+    const cells = line.split("|").map((s) => s.trim()).filter((s) => s.length > 0);
+    if (cells.length === 0) continue;
+    if (cells.every((c) => /^:?-{2,}:?$/.test(c))) continue; // separator row
+    if (!headerCols) {
+      headerCols = cells;
+      continue;
+    }
+    const tmuxIdx = headerCols.findIndex((h) => h.toLowerCase() === "tmux");
+    const parentIdx = headerCols.findIndex((h) => h === "父任务");
+    return {
+      tmux: tmuxIdx >= 0 ? cells[tmuxIdx] : undefined,
+      parent: parentIdx >= 0 ? cells[parentIdx] : undefined,
+    };
+  }
+  return {};
+}
+
+function scanRunState(): BranchNode[] {
+  if (!existsSync(RUN_STATE_ROOT)) return [];
+  const byName = new Map<string, BranchNode>();
+  const walk = (dir: string) => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    if (entries.includes("STATUS.md")) {
+      try {
+        const md = readFileSync(join(dir, "STATUS.md"), "utf8");
+        const id = parseIdentity(md);
+        if (id.tmux) {
+          const name = cleanSessionName(id.tmux);
+          if (name) {
+            // De-dup by tmux name; last writer wins (latest STATUS.md).
+            byName.set(name, { name, parent: parseParent(id.parent || "") });
+          }
+        }
+      } catch {
+        /* skip unreadable / non-standard STATUS.md */
+      }
+    }
+    for (const e of entries) {
+      if (e.startsWith(".")) continue;
+      const full = join(dir, e);
+      try {
+        if (statSync(full).isDirectory()) walk(full);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  walk(RUN_STATE_ROOT);
+  return [...byName.values()];
+}
+
+app.get("/branches", (c) => {
+  const now = Date.now();
+  if (!branchCache || now - branchCache.at > BRANCH_TTL_MS) {
+    branchCache = { at: now, nodes: scanRunState() };
+  }
+  return c.json(branchCache.nodes);
+});
+
 app.post("/sessions", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const name = body.name || `session-${Date.now()}`;
@@ -108,6 +221,20 @@ app.post("/exec/:session", async (c) => {
     return c.json({ success: true });
   }
   return c.json({ success: false, error: "Session not found" }, 404);
+});
+
+// Force a full redraw of a session: ask tmux to refresh all clients attached
+// to that session, which re-pushes a clean frame. Used by the client's "重绘"
+// action to recover from a corrupted browser-side render (e.g. WebGL glitch).
+app.post("/redraw/:session", async (c) => {
+  const session = c.req.param("session");
+  try {
+    const p = spawn(["tmux", "refresh-client", "-t", session]);
+    await p.exited;
+    return c.json({ success: true });
+  } catch {
+    return c.json({ success: false }, 500);
+  }
 });
 
 // Agent status reporting (called by CodeBuddy hook scripts).
@@ -182,6 +309,10 @@ const server = Bun.serve<WsData>({
     return app.fetch(req);
   },
   websocket: {
+    // Bun closes idle websockets after ~120s by default, which silently kills a
+    // terminal you just left sitting there. Raise it to the max and rely on the
+    // client heartbeat to keep the connection (and any proxy in between) warm.
+    idleTimeout: 960,
     async open(ws) {
       const { session, cols, rows } = ws.data;
       console.log(`[WS] open session=${session} cols=${cols} rows=${rows}`);
@@ -217,7 +348,16 @@ const server = Bun.serve<WsData>({
         try {
           const parsed = JSON.parse(message);
           if (parsed.type === "resize" && typeof parsed.cols === "number" && typeof parsed.rows === "number") {
+            if (process.env.TERMX_RESIZE_LOG) {
+              console.log(`[RESIZE] session=${ws.data.session} -> ${parsed.cols}x${parsed.rows}`);
+            }
             pty.resize(parsed.cols, parsed.rows);
+            return;
+          }
+          // Client heartbeat: answer so the client can tell a live connection
+          // from a silently-dropped one. Must not reach the PTY as literal text.
+          if (parsed.type === "ping") {
+            if (ws.readyState === 1) ws.send(JSON.stringify({ type: "pong" }));
             return;
           }
         } catch {}

@@ -26,11 +26,11 @@ bun install -g @zuppif/termx
 ## Usage
 
 ```bash
-cd /your/project
 termx
 ```
 
-Opens on `http://localhost:7681`. Sessions start in the directory you ran the command from.
+Opens on `http://localhost:7681`. New sessions start in your home directory
+(override with `TERMX_CWD`).
 
 ## Options
 
@@ -55,6 +55,37 @@ termx -p 3000 -t "Tokyo Night"
 - Atom One Dark
 - Catppuccin
 - Light
+
+## Session Sidebar
+
+Sessions are listed as cards with a live status dot. Beyond plain switching:
+
+- **Pin** frequently used sessions to a section at the top (right-click a card).
+- **Groups** — create your own groups and drag cards between them.
+- **Drag to reorder** within a section.
+- **Seamless switching** — every session keeps its own live terminal pane and
+  socket, so switching never re-attaches tmux, replays scrollback, or blanks the
+  screen.
+- **Redraw button** (toolbar) forces a clean repaint of the visible terminal if
+  it ever renders wrong.
+- **Export/Import config** (gear icon) — the sidebar layout (groups, pins,
+  order, theme) lives in `localStorage`, which is scoped per origin. If you
+  reach termx through a different URL (localhost vs LAN IP vs a tunnel), the
+  sidebar starts empty. Export on the old URL, import on the new one.
+
+### Branch agents (optional)
+
+If you use the branch-agent workflow, termx can render sub-agents nested under
+their parent session. It reads `~/.codebuddy/run-state/**/STATUS.md` and uses the
+`## 分支身份` table for the authoritative identity:
+
+- the **`tmux`** column — the branch's real tmux session name;
+- the **`父任务`** column written as `由 <parent> 发起` — the parent's tmux name
+  (a human origin, e.g. `由人主会话发起`, marks a root).
+
+Live sessions are then shown as a tree (parents collapsible, siblings
+drag-sortable). Branches whose tmux session no longer exists are hidden. The
+directory layout under `run-state/` is ignored — only the identity table matters.
 
 ## Agent Status (optional)
 
@@ -99,6 +130,7 @@ works until you wire the hooks into your `settings.json`.
        "Notification":     [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",    "timeout": 10 }] }],
        "PermissionRequest":[{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh waiting", "timeout": 10 }] }],
        "Stop":             [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",    "timeout": 10 }] }],
+       "SubagentStop":     [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",    "timeout": 10 }] }],
        "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh idle",    "timeout": 10 }] }]
      }
    }
@@ -107,16 +139,30 @@ works until you wire the hooks into your `settings.json`.
    The full template is in [`hooks/settings.example.json`](hooks/settings.example.json).
 
 3. **Activate.** Run `/hooks` inside CodeBuddy Code (or restart it) to pick up the
-   new config.
+   new config. Already-running CodeBuddy sessions keep their old hook config —
+   run `/hooks` in each, or restart them, or they'll report to the old port /
+   miss new events.
 
 ### How it works
 
 `report-status.sh` reads the hook JSON on stdin, resolves the current tmux session
-via `$TMUX_PANE`, then `POST`s `{ status, message }` to `http://127.0.0.1:$TERMX_PORT/hook/<session>`.
+via `$TMUX_PANE`, then `POST`s `{ status, message }` to `http://$TERMX_HOST:$TERMX_PORT/hook/<session>`.
+The session name is percent-encoded, so names with spaces (`Terminal 1`) work.
 The script always exits 0 so it can never block your agent, and refines the raw
-label from the payload (e.g. `Notification` → `waiting` only for a real
-`permission_prompt`, `PostToolUse` with `success:false` → `error`). The browser
-receives updates over Server-Sent Events at `/events`.
+label from the payload:
+
+| Event | Status |
+|-------|--------|
+| `UserPromptSubmit` | `running` |
+| `PostToolUse` | `running`, or `error` when the payload has `success:false` |
+| `Notification` | `waiting` for `permission_prompt`, `done` for `idle_prompt` |
+| `PermissionRequest` / `PermissionDenied` | `waiting` |
+| `Stop` / `SubagentStop` | `done` (skipped when `stop_hook_active:true`) |
+| `SessionStart` / `SessionEnd` | `idle` |
+
+The browser receives updates over Server-Sent Events at `/events`. Repeated
+reports of the same status keep their original timestamp, so a finished session
+doesn't re-trigger the "unread" blink.
 
 Env vars honored by the script:
 
@@ -124,6 +170,7 @@ Env vars honored by the script:
 |-----|---------|---------|
 | `TERMX_PORT` | `7681` | termx server port |
 | `TERMX_HOST` | `127.0.0.1` | termx server host |
+| `TERMX_HOOK_LOG` | *(unset)* | If set to a file path, log every hook event (debugging) |
 
 `curl` and `tmux` must be available on `PATH` for reporting to work.
 
@@ -153,18 +200,29 @@ Env vars honored by the script:
 | PATCH | `/sessions/:name` | Rename session. Body: `{ name: string }` |
 | POST | `/exec/:session` | Send command. Body: `{ cmd: string }` |
 | POST | `/hook/:session` | Report agent status. Body: `{ status, message }` (used by hooks) |
+| POST | `/redraw/:session` | Ask tmux to re-emit a clean frame (`refresh-client`) |
 | GET | `/events` | Server-Sent Events stream of session status updates |
+| GET | `/branches` | Branch-agent tree: `[{ name, parent }]` parsed from `run-state` STATUS.md |
 
 ### WebSocket
 
-Connect to `/ws/:session?resize=cols,rows`
+Connect to `/ws/:session?resize=cols,rows` (the `resize` param is optional and
+omitted when the client can't yet measure a sane size).
 
 **Client -> Server:**
 - Raw text/binary: PTY stdin
-- JSON `{ type: "resize", cols: number, rows: number }`: resize
+- JSON `{ type: "resize", cols, rows }`: resize. Only sent when the grid actually
+  changes — tmux does a full-screen redraw on *every* resize it receives.
+- JSON `{ type: "ping" }`: heartbeat (every 25s)
 
 **Server -> Client:**
 - Raw binary: PTY stdout
+- JSON `{ type: "pong" }`: heartbeat reply
+
+The client keeps the socket alive with that heartbeat, detects half-open
+connections (no pong for 75s), and reconnects automatically with backoff — plus
+on `visibilitychange` / `focus` / `online`. Server-side `idleTimeout` is raised
+to 960s so a terminal you simply left alone isn't dropped.
 
 ## File Structure
 
@@ -202,9 +260,10 @@ bun run start   # production
 ```bash
 termx --port 3000              # CLI flag
 PORT=3000 termx                # env var
+TERMX_CWD=/path/to/dir termx   # where new sessions start
 ```
 
-Sessions start in `process.cwd()` - wherever you run the command.
+New sessions start in your home directory by default. Override with `TERMX_CWD`.
 
 ## Docker
 

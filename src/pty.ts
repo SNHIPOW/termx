@@ -120,7 +120,11 @@ export async function sendCommand<T extends Command>(cmd: T): Promise<CommandRes
         },
       });
 
-      const proc = spawn(["tmux", "attach", "-t", session], { terminal, env });
+      // -d detaches any other client already attached to this session. Without
+      // it, a browser refresh adds a second client at a different size; tmux then
+      // shrinks the session to the smallest client and pushes a resize+full
+      // redraw to EVERY client, which garbles the other open windows.
+      const proc = spawn(["tmux", "attach", "-d", "-t", session], { terminal, env });
       console.log(`[PTY] Spawned pid=${proc.pid} for session=${session}`);
 
       return {

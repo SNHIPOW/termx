@@ -47,6 +47,13 @@ const PORT = Number.isNaN(parsedPort) ? 7681 : parsedPort;
 const app = new Hono();
 app.use("*", cors());
 
+// Mobile UI. Registered BEFORE serveStatic so the static middleware doesn't
+// swallow "/m" (it would 404 looking for a file of that name).
+app.get("/m", async (c) => {
+  const f = Bun.file(join(PUBLIC_DIR, "mobile.html"));
+  return new Response(f, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+});
+
 app.use("/*", serveStatic({ root: PUBLIC_DIR }));
 
 app.get("/config", (c) => c.json({ theme: DEFAULT_THEME }));
@@ -235,6 +242,40 @@ app.post("/redraw/:session", async (c) => {
   } catch {
     return c.json({ success: false }, 500);
   }
+});
+
+// --- Mobile input API -------------------------------------------------------
+// The mobile UI decouples input from the terminal: you type in a normal text
+// box and press send, instead of driving the xterm cursor directly. Text is
+// typed into the session literally, then Enter is pressed separately (see
+// sendText in pty.ts for why the two steps must be separate).
+app.post("/m/send/:session", async (c) => {
+  const session = c.req.param("session");
+  const body = await c.req.json().catch(() => ({}));
+  const text = typeof body.text === "string" ? body.text : "";
+  if (!text) return c.json({ success: false, error: "Missing text" }, 400);
+  const ok = await sendCommand({ action: "sendText", session, text });
+  return ok ? c.json({ success: true }) : c.json({ success: false }, 404);
+});
+
+// Named keys the mobile key bar may send. Whitelisted so a crafted request
+// can't push arbitrary tmux key syntax (or commands) into a session.
+const ALLOWED_KEYS = new Set([
+  "Escape", "Enter", "Tab", "BTab", "Space", "BSpace",
+  "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown",
+  "C-c", "C-d", "C-r", "C-l", "C-a", "C-e", "C-u", "C-k", "C-z", "C-p", "C-n",
+  "y", "n", "q", "1", "2", "3",
+]);
+
+app.post("/m/key/:session", async (c) => {
+  const session = c.req.param("session");
+  const body = await c.req.json().catch(() => ({}));
+  const key = typeof body.key === "string" ? body.key : "";
+  if (!ALLOWED_KEYS.has(key)) {
+    return c.json({ success: false, error: "Key not allowed" }, 400);
+  }
+  const ok = await sendCommand({ action: "sendKey", session, key });
+  return ok ? c.json({ success: true }) : c.json({ success: false }, 404);
 });
 
 // Agent status reporting (called by CodeBuddy hook scripts).

@@ -23,6 +23,8 @@ type Command =
   | { action: "kill"; name: string }
   | { action: "rename"; oldName: string; newName: string }
   | { action: "keys"; session: string; keys: string }
+  | { action: "sendText"; session: string; text: string }
+  | { action: "sendKey"; session: string; key: string }
   | { action: "attach"; session: string; cols?: number; rows?: number; cwd?: string }
   | { action: "ensureDefault"; cwd?: string };
 
@@ -33,6 +35,8 @@ type CommandResult<T extends Command> =
   T extends { action: "kill" } ? boolean :
   T extends { action: "rename" } ? boolean :
   T extends { action: "keys" } ? boolean :
+  T extends { action: "sendText" } ? boolean :
+  T extends { action: "sendKey" } ? boolean :
   T extends { action: "attach" } ? PtyHandle | null :
   T extends { action: "ensureDefault" } ? void :
   never;
@@ -91,6 +95,33 @@ export async function sendCommand<T extends Command>(cmd: T): Promise<CommandRes
     case "keys": {
       if (!(await sessionExists(cmd.session))) return false as CommandResult<T>;
       const { ok } = await tmux("send-keys", "-t", cmd.session, cmd.keys, "Enter");
+      return ok as CommandResult<T>;
+    }
+
+    // Type a literal line of text into a session, then press Enter separately.
+    // Three things matter here (all are real failure modes, not paranoia):
+    //  1. `-l` sends the text literally. Without it tmux interprets words like
+    //     "Enter" / "C-c" / "Space" as key names instead of characters.
+    //  2. `--` stops option parsing, so text beginning with "-" isn't eaten.
+    //  3. Enter must be a SEPARATE call after a short delay: TUI input boxes
+    //     (the agent prompt) debounce their input, and an Enter arriving in the
+    //     same frame as the text gets swallowed — the message would just sit
+    //     there unsent.
+    // Args are passed as an array (no shell), so ';' and quotes need no escaping.
+    case "sendText": {
+      if (!(await sessionExists(cmd.session))) return false as CommandResult<T>;
+      const typed = await tmux("send-keys", "-t", cmd.session, "-l", "--", cmd.text);
+      if (!typed.ok) return false as CommandResult<T>;
+      await new Promise((r) => setTimeout(r, 300));
+      const { ok } = await tmux("send-keys", "-t", cmd.session, "Enter");
+      return ok as CommandResult<T>;
+    }
+
+    // Send a single named key (Escape, C-c, BTab, Up, ...). Sent as a key name
+    // (no -l) so tmux resolves it; the caller is responsible for whitelisting.
+    case "sendKey": {
+      if (!(await sessionExists(cmd.session))) return false as CommandResult<T>;
+      const { ok } = await tmux("send-keys", "-t", cmd.session, cmd.key);
       return ok as CommandResult<T>;
     }
 

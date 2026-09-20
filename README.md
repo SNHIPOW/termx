@@ -56,6 +56,38 @@ termx -p 3000 -t "Tokyo Night"
 - Catppuccin
 - Light
 
+## Mobile UI (`/m`)
+
+The desktop layout doesn't work well on a phone, so there's a separate mobile
+page on the **same port**:
+
+```
+http://<host>:7681/m
+```
+
+It's app-shaped rather than desktop-shaped:
+
+- **Two screens** — a session list, then tap into a session. Branch agents are
+  nested under their parent, same as the desktop sidebar.
+- **Input is decoupled from the terminal.** The terminal view is read-only
+  (`disableStdin`); you type in a normal text box at the bottom and press send.
+  This avoids fighting the mobile keyboard over cursor position, and means
+  autocorrect can't scribble into a live TUI.
+- **Key bar** for things a phone keyboard can't produce: `Esc`, `⇧Tab`
+  (switches the agent's mode — the main reason this bar exists), arrows, Enter,
+  plus an expandable row with `Tab`, `y`/`n`, `^C`, `^D`, `^R`, PgUp/PgDn,
+  Home/End. `Ctrl` is sticky: tap it, then tap a letter.
+- **A+ / A−** font size control (remembered), auto-sized for the screen on
+  first run.
+- **Touch scrolling** is implemented explicitly (xterm doesn't turn touch drags
+  into scrolls) and the keyboard is handled through `visualViewport`, so the
+  composer isn't hidden behind it on iOS.
+
+How text reaches the agent: the server types it with `tmux send-keys -l`, waits
+a moment, then sends `Enter` as a separate key. Both steps are required — TUI
+prompts debounce their input and swallow an `Enter` that arrives in the same
+frame as the text.
+
 ## Session Sidebar
 
 Sessions are listed as cards with a live status dot. Beyond plain switching:
@@ -194,6 +226,7 @@ Env vars honored by the script:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Terminal UI |
+| GET | `/m` | Mobile UI |
 | GET | `/sessions` | List sessions |
 | POST | `/sessions` | Create session. Body: `{ name?: string }` |
 | DELETE | `/sessions/:name` | Kill session (except "default") |
@@ -203,6 +236,8 @@ Env vars honored by the script:
 | POST | `/redraw/:session` | Ask tmux to re-emit a clean frame (`refresh-client`) |
 | GET | `/events` | Server-Sent Events stream of session status updates |
 | GET | `/branches` | Branch-agent tree: `[{ name, parent }]` parsed from `run-state` STATUS.md |
+| POST | `/m/send/:session` | Mobile: type `{ text }` into the session, then Enter (two-stage) |
+| POST | `/m/key/:session` | Mobile: send one named key `{ key }` (whitelisted) |
 
 ### WebSocket
 
@@ -232,7 +267,8 @@ src/
 ├── pty.ts     # tmux session management via sendCommand()
 └── status.ts  # in-memory agent status store + SSE broadcast
 public/
-└── index.html # xterm.js frontend
+├── index.html  # desktop frontend (xterm.js)
+└── mobile.html # mobile UI (list + session, decoupled input)
 hooks/
 ├── report-status.sh       # CodeBuddy hook -> POST /hook/:session
 └── settings.example.json  # hook config template for settings.json

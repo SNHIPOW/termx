@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <!-- interactive-widget: Android shrinks the layout viewport when the keyboard
+       opens instead of overlaying it. iOS ignores this; handled via visualViewport. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>termx mobile</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.min.css">
+  <style>
+    :root {
+      --bg: #1e1e1e;
+      --bg-elev: #252526;
+      --bg-elev2: #2d2d30;
+      --fg: #d4d4d4;
+      --fg-dim: rgba(212,212,212,0.55);
+      --border: #3c3c3c;
+      --accent: #0a84ff;
+      --accent-soft: rgba(10,132,255,0.16);
+      /* Height of the *visible* viewport; kept in sync with visualViewport so
+         the layout never hides behind the on-screen keyboard. */
+      --app-h: 100dvh;
+      --safe-b: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; padding: 0;
+      height: 100%;
+      background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overscroll-behavior: none;   /* no pull-to-refresh / rubber banding */
+    }
+    body { overflow: hidden; }
+
+    #app { height: var(--app-h); display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ---------- generic bits ---------- */
+    .row { display: flex; align-items: center; gap: 10px; }
+    .grow { flex: 1; min-width: 0; }
+    .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    button { font: inherit; color: inherit; background: none; border: none; }
+
+    .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: #888; }
+    .dot.running { background: #0dbc79; }
+    .dot.waiting { background: #e5e510; animation: blink 1s steps(1,end) infinite; }
+    .dot.done    { background: #ffffff; animation: blink 1s steps(1,end) infinite; }
+    .dot.error   { background: #cd3131; animation: blink 1s steps(1,end) infinite; }
+    .dot.idle    { background: #6b6b6b; }
+    @keyframes blink { 50% { opacity: 0.25; } }
+
+    /* ---------- pages ---------- */
+    .page { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+    .page.active { display: flex; }
+
+    header {
+      height: 52px; flex: none; padding: 0 12px;
+      display: flex; align-items: center; gap: 10px;
+      background: var(--bg-elev); border-bottom: 1px solid var(--border);
+      padding-top: env(safe-area-inset-top, 0px);
+      height: calc(52px + env(safe-area-inset-top, 0px));
+    }
+    header .title { font-size: 15px; font-weight: 600; }
+    header button.icon {
+      width: 40px; height: 40px; flex: none; border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 19px; color: var(--accent);
+    }
+    header button.icon:active { background: var(--accent-soft); }
+
+    /* ---------- list page ---------- */
+    #list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+            padding: 8px 10px calc(16px + var(--safe-b)); }
+    .card {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 12px; margin-bottom: 8px;
+      background: var(--bg-elev); border: 1px solid var(--border);
+      border-radius: 11px;
+    }
+    .card:active { background: var(--bg-elev2); }
+    .card .name { font-size: 15px; }
+    .card .chev { color: var(--fg-dim); font-size: 18px; flex: none; }
+    .sec {
+      font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--fg-dim); padding: 14px 4px 6px;
+    }
+
+    /* ---------- session page ---------- */
+    #termWrap {
+      flex: 1; min-height: 0; position: relative;
+      background: var(--bg); overflow: hidden;
+      touch-action: none;           /* we translate touch into scroll ourselves */
+    }
+    #term { position: absolute; inset: 0; }
+
+    #inputBar {
+      flex: none;
+      background: var(--bg-elev); border-top: 1px solid var(--border);
+      padding: 8px 10px calc(8px + var(--safe-b));
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    /* key bar */
+    .keys { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .keys::-webkit-scrollbar { display: none; }
+    .keys button {
+      flex: none; padding: 8px 11px; border-radius: 8px;
+      background: var(--bg-elev2); border: 1px solid var(--border);
+      font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: nowrap;
+    }
+    .keys button:active { background: var(--accent-soft); border-color: var(--accent); }
+    .keys button.armed { background: var(--accent); color: #fff; border-color: var(--accent); }
+    #keysMore { display: none; }
+    #keysMore.open { display: flex; }
+
+    .composer { display: flex; align-items: flex-end; gap: 8px; }
+    #input {
+      flex: 1; min-width: 0;
+      background: var(--bg); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; font-size: 16px;   /* >=16px stops iOS auto-zoom */
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      resize: none; max-height: 120px; line-height: 1.4;
+      outline: none;
+    }
+    #input:focus { border-color: var(--accent); }
+    #send {
+      flex: none; width: 46px; height: 42px; border-radius: 10px;
+      background: var(--accent); color: #fff; font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #send:disabled { opacity: .4; }
+    #send:active { filter: brightness(.9); }
+
+    .toast {
+      position: fixed; left: 50%; bottom: calc(96px + var(--safe-b));
+      transform: translateX(-50%);
+      background: rgba(0,0,0,.85); color: #fff;
+      padding: 8px 14px; border-radius: 8px; font-size: 13px;
+      opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 100;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- ============ LIST PAGE ============ -->
+    <section id="pageList" class="page active">
+      <header>
+        <span class="title grow">termx</span>
+        <button class="icon" onclick="refreshAll()" title="刷新">⟳</button>
+      </header>
+      <div id="list"></div>
+    </section>
+
+    <!-- ============ SESSION PAGE ============ -->
+    <section id="pageTerm" class="page">
+      <header>
+        <button class="icon" onclick="goList()" title="返回">‹</button>
+        <span class="dot" id="sDot"></span>
+        <span class="title grow truncate" id="sName"></span>
+        <button class="icon" onclick="fontStep(-1)" title="缩小">A−</button>
+        <button class="icon" onclick="fontStep(1)" title="放大">A+</button>
+        <button class="icon" onclick="doRedraw()" title="重绘">⟳</button>
+      </header>
+
+      <div id="termWrap"><div id="term"></div></div>
+
+      <div id="inputBar">
+        <div class="keys" id="keysMain"></div>
+        <div class="keys" id="keysMore"></div>
+        <div class="composer">
+          <textarea id="input" rows="1" placeholder="输入消息…"
+            inputmode="text" autocomplete="off" autocorrect="off"
+            autocapitalize="off" spellcheck="false"></textarea>
+          <button id="send" onclick="sendText()" title="发送">➤</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js"></script>
+  <script>
+  'use strict';
+
+  // ===================== viewport / keyboard ==============================
+  // iOS Safari overlays the keyboard without changing the layout viewport, so a
+  // plain 100dvh layout ends up underneath it. visualViewport reports the part
+  // that is actually visible; we mirror it into --app-h. (position:fixed is NOT
+  // reliable on iOS here — it drifts while the keyboard animates.)
+  const vv = window.visualViewport;
+  function syncViewport() {
+    const h = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty('--app-h', h + 'px');
+    // Keep the page pinned to the top; iOS likes to scroll the whole document.
+    window.scrollTo(0, 0);
+    if (term && fit && pageTerm.classList.contains('active')) scheduleFit();
+  }
+  if (vv) {
+    vv.addEventListener('resize', syncViewport);
+    vv.addEventListener('scroll', syncViewport);
+  }
+  window.addEventListener('orientationchange', () => setTimeout(syncViewport, 200));
+  window.addEventListener('resize', syncViewport);
+
+  // ===================== state ============================================
+  const pageList = document.getElementById('pageList');
+  const pageTerm = document.getElementById('pageTerm');
+  const listEl   = document.getElementById('list');
+  const sNameEl  = document.getElementById('sName');
+  const sDotEl   = document.getElementById('sDot');
+  const inputEl  = document.getElementById('input');
+  const sendBtn  = document.getElementById('send');
+  const toastEl  = document.getElementById('toast');
+
+  let sessions = [];        // [{name, status}]
+  let branches = [];        // [{name, parent}]
+  let statusMap = {};       // name -> {status, message}
+  let current = null;       // active session name
+  let term = null, fit = null, ws = null, wsReady = false;
+  let hbTimer = null, retryTimer = null, retry = 0, lastPong = 0, connId = 0;
+
+  const FONT_KEY = 'termx-m-font';
+  let fontSize = parseInt(localStorage.getItem(FONT_KEY) || '0', 10) || autoFont();
+
+  // Pick a font size that yields a usable column count on this screen.
+  // ~0.6em per cell width; aim for >=60 columns but never go below 9px.
+  function autoFont() {
+    const w = Math.min(window.innerWidth, window.innerHeight * 1.6);
+    return Math.max(9, Math.min(15, Math.floor(w / 60 / 0.6)));
+  }
+
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => toastEl.classList.remove('show'), 1600);
+  }
+
+  const esc = (s) => String(s).replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+  function statusOf(name) {
+    const st = statusMap[name];
+    if (st && st.status) return st.status;
+    const s = sessions.find(x => x.name === name);
+    return (s && s.status) || 'idle';
+  }
+
+  // ===================== list page ========================================
+  function cardHtml(s, depth) {
+    const pad = 12 + depth * 18;
+    return `<div class="card" style="padding-left:${pad}px" onclick="openSession('${esc(s.name).replace(/'/g,"\\'")}')">
+      <span class="dot ${statusOf(s.name)}"></span>
+      <span class="name grow truncate">${esc(s.name)}</span>
+      <span class="chev">›</span>
+    </div>`;
+  }
+
+  function renderList() {
+    const live = new Set(sessions.map(s => s.name));
+    const byName = new Map(sessions.map(s => [s.name, s]));
+
+    // Branch-agent tree: only nodes whose tmux session is alive.
+    const bLive = branches.filter(b => live.has(b.name));
+    const bSet = new Map(bLive.map(b => [b.name, b]));
+    const kids = new Map(); const roots = [];
+    for (const b of bLive) {
+      if (b.parent && bSet.has(b.parent)) {
+        if (!kids.has(b.parent)) kids.set(b.parent, []);
+        kids.get(b.parent).push(b.name);
+      } else roots.push(b.name);
+    }
+    const placed = new Set(bLive.map(b => b.name));
+
+    let html = '';
+    if (roots.length) {
+      html += '<div class="sec">分支 Agent</div>';
+      const seen = new Set();
+      const walk = (n, d) => {
+        if (seen.has(n)) return; seen.add(n);
+        html += cardHtml(byName.get(n), d);
+        (kids.get(n) || []).forEach(c => walk(c, d + 1));
+      };
+      roots.forEach(r => walk(r, 0));
+    }
+    const rest = sessions.filter(s => !placed.has(s.name));
+    if (rest.length) {
+      if (roots.length) html += '<div class="sec">其他会话</div>';
+      rest.forEach(s => { html += cardHtml(s, 0); });
+    }
+    listEl.innerHTML = html || '<div class="sec">没有会话</div>';
+  }
+
+  async function refreshAll() {
+    try {
+      const [rs, rb] = await Promise.all([
+        fetch('/sessions').then(r => r.json()).catch(() => []),
+        fetch('/branches').then(r => r.json()).catch(() => []),
+      ]);
+      sessions = Array.isArray(rs) ? rs : [];
+      branches = Array.isArray(rb) ? rb : [];
+      renderList();
+      if (current) updateHeader();
+    } catch {}
+  }
+
+  // ===================== session page =====================================
+  function goList() {
+    pageTerm.classList.remove('active');
+    pageList.classList.add('active');
+    inputEl.blur();
+    // Keep the socket open in the background so output isn't missed.
+    renderList();
+  }
+
+  function updateHeader() {
+    if (!current) return;
+    sNameEl.textContent = current;
+    sDotEl.className = 'dot ' + statusOf(current);
+  }
+
+  function openSession(name) {
+    current = name;
+    pageList.classList.remove('active');
+    pageTerm.classList.add('active');
+    updateHeader();
+    ensureTerm();
+    connect(name);
+    scheduleFit();
+  }
+
+  function ensureTerm() {
+    if (term) return;
+    term = new Terminal({
+      fontSize,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      scrollback: 3000,
+      cursorBlink: false,
+      // Input is decoupled: typing happens in the composer, not the terminal.
+      disableStdin: true,
+      theme: {
+        background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#d4d4d4',
+        black:'#000000', red:'#cd3131', green:'#0dbc79', yellow:'#e5e510',
+        blue:'#2472c8', magenta:'#bc3fbc', cyan:'#11a8cd', white:'#e5e5e5',
+        brightBlack:'#666666', brightRed:'#f14c4c', brightGreen:'#23d18b',
+        brightYellow:'#f5f543', brightBlue:'#3b8eea', brightMagenta:'#d670d6',
+        brightCyan:'#29b8db', brightWhite:'#ffffff',
+      },
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('term'));
+    // Deliberately NO WebGL addon: mobile GPUs are tight on contexts and the
+    // DOM renderer is plenty for a read-only view.
+    wireTouchScroll();
+  }
+
+  let fitRaf = 0;
+  function scheduleFit() {
+    if (fitRaf) return;
+    fitRaf = requestAnimationFrame(() => {
+      fitRaf = 0;
+      if (!fit || !term) return;
+      try { fit.fit(); } catch {}
+      sendResize();
+    });
+  }
+
+  let sentCols = 0, sentRows = 0;
+  function sendResize() {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !term) return;
+    const c = term.cols, r = term.rows;
+    if (c === sentCols && r === sentRows) return;  // tmux redraws on every resize
+    sentCols = c; sentRows = r;
+    ws.send(JSON.stringify({ type: 'resize', cols: c, rows: r }));
+  }
+
+  function fontStep(d) {
+    fontSize = Math.max(8, Math.min(22, fontSize + d));
+    localStorage.setItem(FONT_KEY, String(fontSize));
+    if (term) { term.options.fontSize = fontSize; scheduleFit(); }
+    toast('字号 ' + fontSize);
+  }
+
+  // xterm doesn't turn touch drags into scrolling, so do it ourselves and feed
+  // the terminal wheel-equivalent scrolls.
+  function wireTouchScroll() {
+    const el = document.getElementById('termWrap');
+    let startY = 0, lastY = 0, acc = 0, dragging = false;
+    el.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      dragging = true; startY = lastY = e.touches[0].clientY; acc = 0;
+    }, { passive: true });
+    el.addEventListener('touchmove', (e) => {
+      if (!dragging || e.touches.length !== 1 || !term) return;
+      const y = e.touches[0].clientY;
+      acc += (lastY - y);
+      lastY = y;
+      const cell = Math.max(12, fontSize * 1.4);
+      const lines = Math.trunc(acc / cell);
+      if (lines !== 0) { term.scrollLines(lines); acc -= lines * cell; }
+      e.preventDefault();
+    }, { passive: false });
+    const end = () => { dragging = false; };
+    el.addEventListener('touchend', end, { passive: true });
+    el.addEventListener('touchcancel', end, { passive: true });
+  }
+
+  // ===================== websocket (receive only) =========================
+  function connect(name) {
+    // Reuse the socket if we're already on this session.
+    if (ws && ws._session === name &&
+        (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    closeSocket();
+    term.reset();
+    openSocket(name);
+  }
+
+  function closeSocket() {
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    connId++;
+    if (ws) {
+      try { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; ws.close(); } catch {}
+      ws = null;
+    }
+    wsReady = false; sentCols = 0; sentRows = 0;
+  }
+
+  function openSocket(name) {
+    const my = ++connId;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ok = term && term.cols >= 20 && term.rows >= 5;
+    const q = ok ? `?resize=${term.cols},${term.rows}` : '';
+    if (ok) { sentCols = term.cols; sentRows = term.rows; }
+    const sock = new WebSocket(`${proto}//${location.host}/ws/${encodeURIComponent(name)}${q}`);
+    sock._session = name;
+    sock.binaryType = 'arraybuffer';
+    ws = sock;
+
+    sock.onopen = () => {
+      if (my !== connId) return;
+      const wasRetry = retry > 0;
+      retry = 0; wsReady = true; lastPong = Date.now();
+      if (hbTimer) clearInterval(hbTimer);
+      hbTimer = setInterval(() => {
+        if (my !== connId || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastPong > 75000) { try { ws.close(); } catch {} return; }
+        try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+      }, 25000);
+      if (wasRetry) setTimeout(() => doRedraw(true), 150);
+    };
+    sock.onmessage = (e) => {
+      if (my !== connId) return;
+      if (typeof e.data === 'string') {
+        try { const m = JSON.parse(e.data); if (m && m.type === 'pong') { lastPong = Date.now(); return; } } catch {}
+        term.write(e.data);
+        return;
+      }
+      lastPong = Date.now();
+      term.write(new Uint8Array(e.data));
+    };
+    sock.onclose = () => {
+      if (my !== connId) return;
+      ws = null; wsReady = false;
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+      retry++;
+      const delay = Math.min(1000 * Math.pow(1.6, retry - 1), 15000);
+      retryTimer = setTimeout(() => { if (my === connId && current) openSocket(current); }, delay);
+    };
+    sock.onerror = () => {};
+  }
+
+  function reviveIfDead() {
+    if (current && pageTerm.classList.contains('active') &&
+        (!ws || ws.readyState === WebSocket.CLOSED)) {
+      retry = 0; openSocket(current);
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { reviveIfDead(); syncViewport(); }
+  });
+  window.addEventListener('online', reviveIfDead);
+
+  async function doRedraw(silent) {
+    if (!current) return;
+    try { fit && fit.fit(); } catch {}
+    try { term && term.refresh(0, term.rows - 1); } catch {}
+    try { await fetch(`/redraw/${encodeURIComponent(current)}`, { method: 'POST' }); } catch {}
+    if (!silent) toast('已重绘');
+  }
+
+  // ===================== sending ==========================================
+  async function sendText() {
+    const text = inputEl.value;
+    if (!text.trim() || !current) return;
+    sendBtn.disabled = true;
+    try {
+      const r = await fetch(`/m/send/${encodeURIComponent(current)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      if (r.ok) {
+        inputEl.value = '';
+        autoGrow();
+      } else {
+        toast('发送失败');
+      }
+    } catch { toast('发送失败'); }
+    sendBtn.disabled = false;
+  }
+
+  async function sendKey(key) {
+    if (!current) return;
+    try {
+      const r = await fetch(`/m/key/${encodeURIComponent(current)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      });
+      if (!r.ok) toast('按键失败');
+    } catch { toast('按键失败'); }
+  }
+
+  // ===================== key bar ==========================================
+  // Ctrl is "sticky": tap Ctrl, then tap a letter -> sends C-<letter>.
+  let ctrlArmed = false;
+
+  const MAIN_KEYS = [
+    { label: 'Esc',   key: 'Escape' },
+    { label: '⇧Tab',  key: 'BTab' },     // switches agent mode; impossible on a phone keyboard
+    { label: 'Ctrl',  ctrl: true },
+    { label: '↑',     key: 'Up' },
+    { label: '↓',     key: 'Down' },
+    { label: '⏎',     key: 'Enter' },
+    { label: '⋯',     more: true },
+  ];
+  const MORE_KEYS = [
+    { label: 'Tab',  key: 'Tab' },
+    { label: 'y',    key: 'y' },
+    { label: 'n',    key: 'n' },
+    { label: '←',    key: 'Left' },
+    { label: '→',    key: 'Right' },
+    { label: '^C',   key: 'C-c' },
+    { label: '^D',   key: 'C-d' },
+    { label: '^R',   key: 'C-r' },
+    { label: '^L',   key: 'C-l' },
+    { label: 'PgUp', key: 'PageUp' },
+    { label: 'PgDn', key: 'PageDown' },
+    { label: 'Home', key: 'Home' },
+    { label: 'End',  key: 'End' },
+  ];
+
+  function buildKeys() {
+    const main = document.getElementById('keysMain');
+    const more = document.getElementById('keysMore');
+    const mk = (spec) => {
+      const b = document.createElement('button');
+      b.textContent = spec.label;
+      if (spec.ctrl) {
+        b.id = 'btnCtrl';
+        b.onclick = () => { ctrlArmed = !ctrlArmed; b.classList.toggle('armed', ctrlArmed); };
+      } else if (spec.more) {
+        b.onclick = () => {
+          more.classList.toggle('open');
+          b.textContent = more.classList.contains('open') ? '×' : '⋯';
+          scheduleFit();
+        };
+      } else {
+        b.onclick = () => {
+          if (ctrlArmed && /^[a-z]$/.test(spec.key)) {
+            sendKey('C-' + spec.key);
+          } else {
+            sendKey(spec.key);
+          }
+          if (ctrlArmed) {
+            ctrlArmed = false;
+            const cb = document.getElementById('btnCtrl');
+            if (cb) cb.classList.remove('armed');
+          }
+        };
+      }
+      return b;
+    };
+    MAIN_KEYS.forEach(s => main.appendChild(mk(s)));
+    MORE_KEYS.forEach(s => more.appendChild(mk(s)));
+  }
+
+  // ===================== composer =========================================
+  function autoGrow() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+    scheduleFit();
+  }
+  inputEl.addEventListener('input', autoGrow);
+  inputEl.addEventListener('focus', () => setTimeout(syncViewport, 150));
+  inputEl.addEventListener('blur', () => setTimeout(syncViewport, 150));
+
+  // ===================== status stream ====================================
+  function connectEvents() {
+    const es = new EventSource('/events');
+    es.onmessage = (e) => {
+      let d; try { d = JSON.parse(e.data); } catch { return; }
+      if (d.type === 'snapshot') {
+        Object.entries(d.statuses || {}).forEach(([n, i]) => { statusMap[n] = i; });
+      } else if (d.session) {
+        statusMap[d.session] = { status: d.status, message: d.message, updatedAt: d.updatedAt };
+      }
+      if (pageList.classList.contains('active')) renderList();
+      else updateHeader();
+    };
+    es.onerror = () => {};
+  }
+
+  // ===================== boot =============================================
+  buildKeys();
+  syncViewport();
+  refreshAll();
+  connectEvents();
+  setInterval(refreshAll, 10000);
+  </script>
+</body>
+</html>

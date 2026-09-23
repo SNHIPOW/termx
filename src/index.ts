@@ -397,22 +397,32 @@ app.get("/events", (c) => {
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder();
+      let dead = false;
+      const cleanup = () => {
+        if (dead) return;
+        dead = true;
+        clearInterval(ping);
+        unsub();
+        try { controller.close(); } catch {}
+      };
       const send = (payload: string) => {
+        if (dead) return;
+        // A failed write means the client is gone (phone switched networks,
+        // tab killed, ...). Swallowing it let zombie streams pile up: the dead
+        // TCP connection still counts against the browser's ~6-per-origin
+        // connection limit, and once enough accumulate the page can't load
+        // anything at all — the recurring "手机连不上" failure mode.
         try {
           controller.enqueue(enc.encode(payload));
-        } catch {}
+        } catch {
+          cleanup();
+        }
       };
       // Initial full snapshot.
       send(`data: ${JSON.stringify({ type: "snapshot", statuses: getAllStatus() })}\n\n`);
       const unsub = subscribe(send);
-      const ping = setInterval(() => send(`: ping\n\n`), 30000);
-      c.req.raw.signal.addEventListener("abort", () => {
-        clearInterval(ping);
-        unsub();
-        try {
-          controller.close();
-        } catch {}
-      });
+      const ping = setInterval(() => send(`: ping\n\n`), 15000);
+      c.req.raw.signal.addEventListener("abort", cleanup);
     },
   });
   return new Response(stream, {

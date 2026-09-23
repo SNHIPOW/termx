@@ -83,6 +83,15 @@
     .sec {
       font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
       color: var(--fg-dim); padding: 14px 4px 6px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .sec[onclick] { cursor: pointer; -webkit-user-select: none; user-select: none; }
+    .sec[onclick]:active { color: var(--fg); }
+    .sec .sec-ar { font-size: 10px; flex: none; }
+    .sec .sec-count {
+      font-size: 10px; font-weight: 600; flex: none;
+      background: var(--bg-elev2); border: 1px solid var(--border);
+      border-radius: 999px; padding: 0 7px; line-height: 15px; min-width: 18px; text-align: center;
     }
 
     /* ---------- session page ---------- */
@@ -210,6 +219,22 @@
       opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 100;
     }
     .toast.show { opacity: 1; }
+
+    #connBanner {
+      position: fixed; top: calc(env(safe-area-inset-top, 0px) + 8px);
+      left: 50%; transform: translateX(-50%); z-index: 200;
+      display: flex; align-items: center; gap: 12px;
+      background: #3a2b00; color: #f5f543;
+      border: 1px solid #6b5d1f; border-radius: 10px;
+      padding: 10px 14px; font-size: 13px;
+      box-shadow: 0 4px 16px rgba(0,0,0,.4);
+      max-width: calc(100vw - 24px);
+    }
+    #connBanner.hidden { display: none; }
+    #connBanner button {
+      flex: none; background: #f5f543; color: #1e1e1e;
+      border-radius: 7px; padding: 6px 10px; font-size: 12px; font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -266,6 +291,13 @@
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- Connection health banner: visible only when requests keep failing.
+       Gives "连不上" a face instead of a silent hang. -->
+  <div id="connBanner" class="hidden">
+    <span>连接不稳定，正在自动重试…</span>
+    <button onclick="location.reload()">立即刷新</button>
+  </div>
 
   <script>
   'use strict';
@@ -342,29 +374,21 @@
   }
 
   // ===================== list page ========================================
-  // A 'done' the user has already looked at shouldn't keep blinking white.
-  // Keyed by the status timestamp, so a NEW completion blinks again.
-  const READ_KEY = 'termx-m-read';
-  let readDone = {};
-  try { readDone = JSON.parse(localStorage.getItem(READ_KEY) || '{}'); } catch {}
+  // "Unread completion" tracking without timestamps: polling carries no
+  // updatedAt, so a completion is NEW only if we watched the transition happen
+  // (previous poll said running/error, this poll says done). Anything already
+  // done when the page loaded never blinks — a refresh can't resurrect it.
+  let unreadDone = new Set();
 
   function markRead(name) {
-    const st = statusMap[name];
-    if (st && st.status === 'done') {
-      readDone[name] = st.updatedAt || 0;
-      try { localStorage.setItem(READ_KEY, JSON.stringify(readDone)); } catch {}
-    }
+    unreadDone.delete(name);
   }
 
   // Status used for display: a viewed 'done' collapses to a calm gray dot.
   function dotOf(name) {
     const s = statusOf(name);
     if (s !== 'done') return s;
-    const st = statusMap[name];
-    // No live entry (only the /sessions fallback) => it was already done when
-    // the page loaded; treat as seen so a refresh doesn't resurrect blinking.
-    if (!st || st.updatedAt == null) return 'idle';
-    return readDone[name] === st.updatedAt ? 'idle' : 'done';
+    return unreadDone.has(name) ? 'done' : 'idle';
   }
 
   // ===================== shared layout (from the desktop) ==================
@@ -386,12 +410,52 @@
     try { const r = JSON.parse(v); return r ?? fb; } catch { return fb; }
   }
 
+  // Collapsed sections on the list page: group ids and branch-agent parent
+  // names. Persisted locally; defaults to expanded.
+  const COLLAPSE_KEY = 'termx-m-collapsed';
+  let collapsed = {};
+  try { collapsed = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '{}'); } catch {}
+  function persistCollapsed() {
+    try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed)); } catch {}
+  }
+  function toggleCollapse(key) {
+    collapsed[key] = !collapsed[key];
+    persistCollapsed();
+    renderList();
+  }
+
   function cardHtml(s, depth) {
     const pad = 12 + depth * 18;
     return `<div class="card" style="padding-left:${pad}px" onclick="openSession('${esc(s.name).replace(/'/g,"\\'")}')">
       <span class="dot ${dotOf(s.name)}"></span>
       <span class="name grow truncate">${esc(s.name)}</span>
       <span class="chev">›</span>
+    </div>`;
+  }
+
+  // A branch parent: tappable card that also folds its sub-agents.
+  function branchCardHtml(name, depth, childCount) {
+    const s = { name };
+    const pad = 12 + depth * 18;
+    const isCol = !!collapsed[name] && childCount > 0;
+    const arrow = childCount > 0
+      ? `<span class="chev" onclick="event.stopPropagation(); toggleCollapse('${esc(name).replace(/'/g,"\\'")}')">${isCol ? '▸' : '▾'}</span>`
+      : '';
+    return `<div class="card" style="padding-left:${pad}px" onclick="openSession('${esc(name).replace(/'/g,"\\'")}')">
+      <span class="dot ${dotOf(name)}"></span>
+      <span class="name grow truncate">${esc(name)}</span>
+      ${arrow}
+      <span class="chev">›</span>
+    </div>`;
+  }
+
+  // Group/section header with a fold toggle and a live count.
+  function sectionHtml(key, label, count, countVisible) {
+    const isCol = !!collapsed[key];
+    return `<div class="sec" onclick="toggleCollapse('${esc(key)}')">
+      <span class="chev sec-ar">${isCol ? '▸' : '▾'}</span>
+      <span class="grow">${esc(label)}</span>
+      <span class="sec-count">${count}</span>
     </div>`;
   }
 
@@ -410,6 +474,12 @@
       } else roots.push(b.name);
     }
     const placed = new Set(bLive.map(b => b.name));
+    // Count every session hiding under a collapsed branch subtree.
+    const subtreeCount = (n) => {
+      let c = 0;
+      (kids.get(n) || []).forEach(k => { c += 1 + subtreeCount(k); });
+      return c;
+    };
 
     let html = '';
     if (roots.length) {
@@ -417,7 +487,10 @@
       const seen = new Set();
       const walk = (n, d) => {
         if (seen.has(n)) return; seen.add(n);
-        html += cardHtml(byName.get(n), d);
+        const childCount = (kids.get(n) || []).length;
+        html += branchCardHtml(n, d, childCount);
+        // Folded parent: skip its subtree entirely.
+        if (childCount > 0 && collapsed[n]) return;
         (kids.get(n) || []).forEach(c => walk(c, d + 1));
       };
       roots.forEach(r => walk(r, 0));
@@ -428,21 +501,21 @@
     const rest = sessions.filter(s => !placed.has(s.name) && !pinned.includes(s.name));
     const pinItems = sessions.filter(s => !placed.has(s.name) && pinned.includes(s.name));
     if (pinItems.length) {
-      html += '<div class="sec">置顶</div>';
-      pinItems.forEach(s => { html += cardHtml(s, 0); });
+      html += sectionHtml('__pin__', '置顶', pinItems.length);
+      if (!collapsed['__pin__']) pinItems.forEach(s => { html += cardHtml(s, 0); });
     }
     const grouped = new Set();
     for (const g of groups) {
       const items = rest.filter(s => sessionGroup[s.name] === g.id);
       if (!items.length) continue;
       items.forEach(s => grouped.add(s.name));
-      html += `<div class="sec">${esc(g.name)}</div>`;
-      items.forEach(s => { html += cardHtml(s, 0); });
+      html += sectionHtml('g:' + g.id, g.name, items.length);
+      if (!collapsed['g:' + g.id]) items.forEach(s => { html += cardHtml(s, 0); });
     }
     const ungrouped = rest.filter(s => !grouped.has(s.name));
     if (ungrouped.length) {
-      html += '<div class="sec">其他会话</div>';
-      ungrouped.forEach(s => { html += cardHtml(s, 0); });
+      html += sectionHtml('__other__', '其他会话', ungrouped.length);
+      if (!collapsed['__other__']) ungrouped.forEach(s => { html += cardHtml(s, 0); });
     }
     listEl.innerHTML = html || '<div class="sec">没有会话</div>';
   }
@@ -616,7 +689,8 @@
       const j = await r.json();
       // Superseded by a newer request, or the user switched session: drop it.
       if (my !== captureSeq || current !== sessionAtStart) return;
-      if (!j.ok || typeof j.text !== 'string') return;
+      if (!j.ok || typeof j.text !== 'string') { noteFetchResult(false); return; }
+      noteFetchResult(true);
 
       // Work out how much history actually exists BEFORE any early return.
       // Doing this after the "unchanged" check meant that once we'd reached the
@@ -643,6 +717,7 @@
       }
     } catch {
       /* transient failure (incl. timeout): the next tick retries */
+      noteFetchResult(false);
     } finally {
       clearTimeout(killer);
       // Only the newest request may release the lock, otherwise a slow straggler
@@ -902,38 +977,84 @@
   inputEl.addEventListener('focus', () => setTimeout(syncViewport, 150));
   inputEl.addEventListener('blur', () => setTimeout(syncViewport, 150));
 
-  // ===================== status stream ====================================
-  let gotSnapshot = false;
-  function connectEvents() {
-    const es = new EventSource('/events');
-    es.onmessage = (e) => {
-      let d; try { d = JSON.parse(e.data); } catch { return; }
-      if (d.type === 'snapshot') {
-        Object.entries(d.statuses || {}).forEach(([n, i]) => { statusMap[n] = i; });
-        // On the FIRST snapshot, anything already finished predates this visit —
-        // treat it as seen so opening the page doesn't blink every session.
-        if (!gotSnapshot) {
-          gotSnapshot = true;
-          Object.entries(statusMap).forEach(([n, i]) => {
-            if (i && i.status === 'done') readDone[n] = i.updatedAt;
-          });
-          try { localStorage.setItem(READ_KEY, JSON.stringify(readDone)); } catch {}
-        }
-      } else if (d.session) {
-        statusMap[d.session] = { status: d.status, message: d.message, updatedAt: d.updatedAt };
-        // Finished while you're watching it => already seen, don't blink.
-        if (d.status === 'done' && d.session === current &&
-            pageTerm.classList.contains('active')) {
-          markRead(d.session);
-        }
-      } else if (d.layout === 'changed') {
-        // The desktop rearranged groups/pins — mirror it here.
-        loadLayout().then(() => { renderList(); });
+  // ===================== connection health =================================
+  // The phone reaches this box over a VPN/carrier link that gets torn down on
+  // every network switch. Long-lived connections (SSE) are the most fragile
+  // thing on such a link, so the mobile page deliberately uses NONE: status
+  // arrives with the /sessions poll, layout with a periodic /layout fetch.
+  // Everything is a short request that either completes or fails cleanly.
+  //
+  // When requests DO fail repeatedly, show it and self-heal: a reload drops
+  // every socket the page owns (including dead ones the browser is still
+  // counting against its ~6-connection-per-origin limit after a network
+  // switch). Capped at one auto-reload per outage.
+  let failStreak = 0;
+  const connBanner = document.getElementById('connBanner');
+
+  function noteFetchResult(ok) {
+    if (ok) {
+      if (failStreak >= 3) toast('连接已恢复');
+      failStreak = 0;
+      if (connBanner) connBanner.classList.add('hidden');
+      // Outage over: re-arm the auto-reload for the next one.
+      if (bootGracePassed) { try { sessionStorage.removeItem('tm-reloaded'); } catch {} }
+      return;
+    }
+    failStreak++;
+    if (failStreak >= 3 && connBanner) connBanner.classList.remove('hidden');
+    if (failStreak >= 6) {
+      // Only reload if we haven't already for this outage, and the page has
+      // been up long enough that this isn't a boot-time loop.
+      if (bootGracePassed && !sessionStorage.getItem('tm-reloaded')) {
+        try { sessionStorage.setItem('tm-reloaded', '1'); } catch {}
+        location.reload();
       }
-      if (pageList.classList.contains('active')) renderList();
-      else updateHeader();
-    };
-    es.onerror = () => {};
+    }
+  }
+  let bootGracePassed = false;
+  setTimeout(() => { bootGracePassed = true; }, 15000);
+
+  // ===================== status & layout (polling) =========================
+  // /sessions carries the status of every session; fold it into statusMap.
+  // A done transition seen between two polls is a fresh completion -> blink
+  // (unless the user is watching that session right now).
+  function foldStatuses(list) {
+    for (const s of list) {
+      if (s && s.name && s.status) {
+        const prev = statusMap[s.name] && statusMap[s.name].status;
+        statusMap[s.name] = { status: s.status, message: s.statusMessage, updatedAt: 0 };
+        if (prev && prev !== 'done' && s.status === 'done') {
+          if (s.name === current && pageTerm.classList.contains('active')) {
+            unreadDone.delete(s.name);   // watched it finish: already seen
+          } else {
+            unreadDone.add(s.name);
+          }
+        }
+      }
+    }
+  }
+
+  let refreshTick = 0;
+  async function refreshAll() {
+    try {
+      const [rs, rb] = await Promise.all([
+        fetch('/sessions').then(r => { if (!r.ok) throw 0; return r.json(); }),
+        fetch('/branches').then(r => r.json()).catch(() => []),
+      ]);
+      sessions = Array.isArray(rs) ? rs : [];
+      branches = Array.isArray(rb) ? rb : [];
+      foldStatuses(sessions);
+      noteFetchResult(true);
+      renderList();
+      if (current) updateHeader();
+    } catch {
+      noteFetchResult(false);
+    }
+    // Layout sync rides along every 3rd tick (~30s): tiny payload, and the
+    // desktop is its editor so a short delay is fine.
+    if (++refreshTick % 3 === 0) {
+      loadLayout().then(() => { if (pageList.classList.contains('active')) renderList(); });
+    }
   }
 
   // ===================== boot =============================================
@@ -943,7 +1064,6 @@
   applyWrap();
   syncViewport();
   loadLayout().then(() => refreshAll());
-  connectEvents();
   setInterval(refreshAll, 10000);
 
   // Don't poll a session the user can't see.

@@ -206,6 +206,19 @@
     #btn-redraw.busy > i { animation: termx-spin 0.6s linear infinite; transform-origin: 50% 50%; }
     #btn-redraw.done { background: var(--accent-soft); }
     #btn-redraw:active { transform: scale(0.92); }
+    /* Text mode: renders tmux captures as plain HTML (the mobile renderer).
+       No GPU context, no grid to misalign — the bulletproof display path. */
+    #textmode {
+      position: absolute; inset: 0; z-index: 5;
+      overflow: auto; background: var(--bg);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px; line-height: 1.35; color: var(--fg);
+      white-space: pre; padding: 8px 12px; margin: 0;
+      overscroll-behavior: contain;
+    }
+    #textmode.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #textmode.hidden { display: none; }
+    #btn-textmode.on { background: var(--accent-soft); }
   </style>
 </head>
 <body>
@@ -222,6 +235,11 @@
                 class="h-10 w-10 md:h-7 md:w-7 rounded-md flex items-center justify-center transition-all hover:bg-white/10 shrink-0"
                 style="color: var(--accent)">
           <i data-lucide="settings" class="w-4 h-4"></i>
+        </button>
+        <button id="btn-textmode" onclick="toggleTextMode()" title="切换 文本模式（手机端同款渲染，不乱码但非实时）"
+                class="h-10 w-10 md:h-7 md:w-7 rounded-md flex items-center justify-center transition-all hover:bg-white/10 shrink-0"
+                style="color: var(--accent)">
+          <i data-lucide="file-text" class="w-4 h-4"></i>
         </button>
         <button id="btn-redraw" onclick="redrawSession()" title="重绘当前终端 (修复乱码)"
                 class="h-10 w-10 md:h-7 md:w-7 rounded-md flex items-center justify-center transition-all hover:bg-white/10 shrink-0"
@@ -255,7 +273,9 @@
 
       <!-- Terminal Container -->
       <main class="flex-1 overflow-hidden p-2" style="background: var(--bg-elev)">
-        <div id="terminal" class="h-full rounded-lg overflow-hidden" style="background: var(--bg); border: 1px solid var(--border); box-shadow: 0 2px 12px rgba(0,0,0,0.25)"></div>
+        <div id="terminal" class="h-full rounded-lg overflow-hidden relative" style="background: var(--bg); border: 1px solid var(--border); box-shadow: 0 2px 12px rgba(0,0,0,0.25)">
+          <pre id="textmode" class="hidden"></pre>
+        </div>
       </main>
     </div>
 
@@ -1358,6 +1378,130 @@
       if (p) p.term.focus();
     }
 
+    // --- Text mode ------------------------------------------------------------
+    // Renders tmux captures as plain HTML — the same path the mobile UI uses.
+    // That path can't produce 乱码: there's no GPU context to lose, no grid to
+    // misalign, no repaint timing. The tradeoff: output arrives in snapshots
+    // (up to ~1.5s behind) instead of a live byte stream, and typing isn't
+    // echoed instantly. A per-session escape hatch when the GPU renderer acts up.
+    const TEXTMODE_KEY = 'termx-textmode';
+    const TM_LINES = 800;         // desktop link can afford more than mobile
+    const TM_POLL_MS = 1500;
+    let textMode = localStorage.getItem(TEXTMODE_KEY) === '1';
+    let tmTimer = null, tmLast = null, tmBusy = false;
+
+    // ANSI SGR -> HTML. Subset tmux actually emits: reset/bold/dim/inverse/
+    // underline, 8+16 colours, 256-colour and truecolour.
+    const TM_BASE16 = [
+      '#000000','#cd3131','#0dbc79','#e5e510','#2472c8','#bc3fbc','#11a8cd','#e5e5e5',
+      '#666666','#f14c4c','#23d18b','#f5f543','#3b8eea','#d670d6','#29b8db','#ffffff',
+    ];
+    function tm256(n) {
+      if (n < 16) return TM_BASE16[n];
+      if (n < 232) {
+        n -= 16;
+        const to = (v) => (v === 0 ? 0 : 55 + v * 40);
+        return `rgb(${to(Math.floor(n/36)%6)},${to(Math.floor(n/6)%6)},${to(n%6)})`;
+      }
+      const g = 8 + (n - 232) * 10;
+      return `rgb(${g},${g},${g})`;
+    }
+    const TM_ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+    function ansiToHtml(input) {
+      let fg = null, bg = null, bold = false, dim = false, inverse = false, underline = false;
+      let out = '', open = false;
+      const closeSpan = () => { if (open) { out += '</span>'; open = false; } };
+      const openSpan = () => {
+        let f = fg, b = bg;
+        if (inverse) { const t = f; f = b || getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#1e1e1e'; b = t || '#d4d4d4'; }
+        const st = [];
+        if (f) st.push(`color:${f}`);
+        if (b) st.push(`background:${b}`);
+        if (bold) st.push('font-weight:700');
+        if (dim) st.push('opacity:.6');
+        if (underline) st.push('text-decoration:underline');
+        if (!st.length) return;
+        out += `<span style="${st.join(';')}">`;
+        open = true;
+      };
+      const re = /\x1b\[([0-9;]*)m|\x1b\[[0-9;?]*[A-Za-z]/g;
+      let last = 0, m;
+      while ((m = re.exec(input)) !== null) {
+        if (m.index > last) { openSpan(); out += input.slice(last, m.index).replace(/[&<>]/g, c => TM_ESC[c]); closeSpan(); }
+        last = re.lastIndex;
+        if (m[1] === undefined) continue;
+        const codes = m[1] === '' ? [0] : m[1].split(';').map(Number);
+        for (let i = 0; i < codes.length; i++) {
+          const c = codes[i];
+          if (c === 0) { fg = bg = null; bold = dim = inverse = underline = false; }
+          else if (c === 1) bold = true;
+          else if (c === 2) dim = true;
+          else if (c === 4) underline = true;
+          else if (c === 7) inverse = true;
+          else if (c === 22) { bold = false; dim = false; }
+          else if (c === 24) underline = false;
+          else if (c === 27) inverse = false;
+          else if (c >= 30 && c <= 37) fg = TM_BASE16[c - 30];
+          else if (c === 39) fg = null;
+          else if (c >= 40 && c <= 47) bg = TM_BASE16[c - 40];
+          else if (c === 49) bg = null;
+          else if (c >= 90 && c <= 97) fg = TM_BASE16[c - 90 + 8];
+          else if (c >= 100 && c <= 107) bg = TM_BASE16[c - 100 + 8];
+          else if ((c === 38 || c === 48) && codes[i + 1] === 5) {
+            const col = tm256(codes[i + 2]);
+            if (c === 38) fg = col; else bg = col;
+            i += 2;
+          } else if ((c === 38 || c === 48) && codes[i + 1] === 2) {
+            const col = `rgb(${codes[i+2]},${codes[i+3]},${codes[i+4]})`;
+            if (c === 38) fg = col; else bg = col;
+            i += 4;
+          }
+        }
+      }
+      if (last < input.length) { openSpan(); out += input.slice(last).replace(/[&<>]/g, c => TM_ESC[c]); closeSpan(); }
+      return out;
+    }
+
+    async function tmPull() {
+      if (!textMode || !currentSession || tmBusy) return;
+      tmBusy = true;
+      try {
+        const r = await fetch(`/m/capture/${encodeURIComponent(currentSession)}?lines=${TM_LINES}`);
+        const j = await r.json();
+        if (!j.ok || typeof j.text !== 'string') return;
+        if (j.text === tmLast) return;
+        tmLast = j.text;
+        const el = document.getElementById('textmode');
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        el.innerHTML = ansiToHtml(j.text.replace(/\s+$/, ''));
+        if (nearBottom) el.scrollTop = el.scrollHeight;
+      } catch { /* next tick retries */ }
+      finally { tmBusy = false; }
+    }
+
+    function applyTextMode() {
+      const el = document.getElementById('textmode');
+      const btn = document.getElementById('btn-textmode');
+      el.classList.toggle('hidden', !textMode);
+      btn.classList.toggle('on', textMode);
+      btn.title = textMode ? '切回终端模式（实时渲染）' : '切换 文本模式（手机端同款渲染，不乱码但非实时）';
+      if (textMode) {
+        tmLast = null;
+        tmPull();
+        if (tmTimer) clearInterval(tmTimer);
+        tmTimer = setInterval(tmPull, TM_POLL_MS);
+      } else {
+        if (tmTimer) { clearInterval(tmTimer); tmTimer = null; }
+        // Back to the live renderer: repaint so the pane isn't stale.
+        if (currentSession) repaintPane(currentSession, { rebuildGl: false, askTmux: true });
+      }
+    }
+    function toggleTextMode() {
+      textMode = !textMode;
+      localStorage.setItem(TEXTMODE_KEY, textMode ? '1' : '0');
+      applyTextMode();
+    }
+
     // --- Local config export/import ------------------------------------------
     // localStorage is scoped per origin, so reaching termx via a different URL
     // (localhost / LAN IP / tunnel) shows an empty sidebar even though nothing
@@ -1524,6 +1668,11 @@
       const prev = currentSession;
       currentSession = session;
       markRead(session);
+
+      // Switching sessions: the text view shows the other session's content,
+      // so drop the cache and pull immediately (if text mode is on).
+      tmLast = null;
+      if (textMode) tmPull();
 
       const p = ensurePane(session);
       // Give the now-active pane a WebGL renderer (evicting an old one if needed).
@@ -1756,6 +1905,7 @@
     connectEvents();
     refreshBranches();
     setInterval(refreshBranches, 3000);
+    if (textMode) applyTextMode();   // restore the saved display mode
   </script>
 </body>
 </html>

@@ -48,6 +48,16 @@ const PORT = Number.isNaN(parsedPort) ? 7681 : parsedPort;
 const app = new Hono();
 app.use("*", cors());
 
+// Keep-alive on every response: the mobile UI is all short polling requests,
+// and without this header the browser treats each connection as one-shot —
+// a new socket per poll that piles up past its ~6-connections-per-origin
+// limit. With keep-alive the same pool handles every tick.
+app.use("*", async (c, next) => {
+  await next();
+  c.header("Connection", "keep-alive");
+  c.header("Keep-Alive", "timeout=25");
+});
+
 // Mobile UI. Registered BEFORE serveStatic so the static middleware doesn't
 // swallow "/m" (it would 404 looking for a file of that name).
 // Read the file into a string rather than streaming Bun.file: streaming left

@@ -1036,12 +1036,13 @@
 
   let refreshTick = 0;
   async function refreshAll() {
+    // Sequential on purpose: each parallel fetch is another socket on a
+    // connection-limited mobile link; two at once doubles the chance one
+    // stalls behind the browser's ~6-per-origin cap.
     try {
-      const [rs, rb] = await Promise.all([
-        fetch('/sessions').then(r => { if (!r.ok) throw 0; return r.json(); }),
-        fetch('/branches').then(r => r.json()).catch(() => []),
-      ]);
+      const rs = await fetch('/sessions').then(r => { if (!r.ok) throw 0; return r.json(); });
       sessions = Array.isArray(rs) ? rs : [];
+      const rb = await fetch('/branches').then(r => r.json()).catch(() => []);
       branches = Array.isArray(rb) ? rb : [];
       foldStatuses(sessions);
       noteFetchResult(true);

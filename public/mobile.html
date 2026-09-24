@@ -759,6 +759,42 @@
   // 300ms server-side), so change latency is ~300ms + half an RTT — the same
   // freshness a WebSocket push would give, but it's still a plain request that
   // fails cleanly on network switches and never leaves zombies behind.
+  // Hedged watch: if the primary watch hasn't answered within HEDGE_DELAY,
+  // fire a second identical one and race them — take whichever response
+  // arrives first, abort the other. The phone link suffers intermittent
+  // one-way loss (measured: SYNs arrive, SYN-ACKs vanish), so a request can
+  // silently die in flight; a racing copy means one lost packet costs 6s
+  // instead of a full retransmit timeout (tens of seconds).
+  // Duplicates are safe: each watch computes its delta against the SAME client
+  // etag server-side, so both would return the same content; the loser is
+  // aborted before its body is ever read.
+  const HEDGE_DELAY = 6000;
+  async function hedgedWatch(url, signal) {
+    let hedgeAc = null, timer = null;
+    const primary = fetch(url, { signal });
+    // NOTE: resolve(fetch(...)) auto-unwraps, so hedgePromise settles only when
+    // the hedged fetch settles — the race below works on settled values.
+    const hedgePromise = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        hedgeAc = new AbortController();
+        resolve(fetch(url, { signal: hedgeAc.signal }).catch(() => null));
+      }, HEDGE_DELAY);
+    });
+    try {
+      // null (falsy) when the timer hasn't fired: Promise.race skips it and
+      // waits on primary alone.
+      const winner = await Promise.race([
+        primary.then(r => ({ r })),
+        hedgePromise.then(p => (p ? { r: p } : null)),
+      ]);
+      if (winner) return winner.r;
+      return await primary;
+    } finally {
+      clearTimeout(timer);
+      if (hedgeAc) { try { hedgeAc.abort(); } catch {} }
+    }
+  }
+
   async function watchLoop() {
     const my = ++captureSeq;
     while (current && pageTerm.classList.contains('active') && my === captureSeq) {
@@ -766,9 +802,9 @@
       watchAbort = new AbortController();
       try {
         const q = `lines=${captureLines}` + (lastTag ? `&etag=${encodeURIComponent(lastTag)}` : '');
-        const r = await fetch(
+        const r = await hedgedWatch(
           `/m/watch/${encodeURIComponent(current)}?${q}`,
-          { signal: watchAbort.signal });
+          watchAbort.signal);
         if (my !== captureSeq || current !== sessionAtStart) return;   // superseded
         if (r.status === 304) {
           // Hold expired with no change: re-arm immediately.

@@ -772,9 +772,15 @@
   // slow when nothing changes. Polling a quiet session hard was pure link
   // abuse — every tick a full-window payload across a flaky carrier path.
   function nextPollDelay() {
-    const quiet = Math.min(POLL_FAST * Math.pow(2, quietTicks), POLL_SLOW);
+    // Back off on BOTH quiet (nothing changing) and failure. Retrying at the
+    // fast rate while the carrier link is already degraded just piles new
+    // requests onto a congested path — measured as ~20 simultaneous phone
+    // connections with FIN litter, feeding the very fluctuation we're trying
+    // to ride out. Let the link breathe; snap back to fast once it recovers.
+    let delay = Math.max(POLL_FAST * Math.pow(2, quietTicks), POLL_FAST);
+    if (failStreak > 0) delay = Math.max(delay, POLL_FAST * Math.pow(2, failStreak + 1));
     const big = captureLines > 2000 ? 2 : 1;   // bigger window, gentler pace
-    return Math.min(quiet * big, POLL_SLOW * 2);
+    return Math.min(delay * big, 30000);
   }
 
   function updateMoreBtn() {

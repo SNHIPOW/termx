@@ -573,6 +573,20 @@ const wsPtyMap = new Map<unknown, PtyHandle>();
 
 await sendCommand({ action: "ensureDefault", cwd: SESSION_CWD });
 
+// --- Health self-reporting ---------------------------------------------------
+// The server has shown slow degradation over hours (RSS climbing from ~90MB
+// to 440MB+, connections going stale) whose root cause isn't visible from a
+// single inspection. Log the trend every 5 minutes so the next degradation
+// leaves a data trail: memory, attached PTYs, watch state, connection count.
+setInterval(() => {
+  try {
+    const rss = readFileSync("/proc/self/status", "utf8").match(/VmRSS:\s+(\d+)/);
+    console.log(
+      `[HEALTH] rss=${rss ? rss[1] : "?"}KB wsPtys=${wsPtyMap.size} watchKeys=${lastServed.size}`,
+    );
+  } catch {}
+}, 5 * 60 * 1000);
+
 const server = Bun.serve<WsData>({
   port: PORT,
   hostname: "0.0.0.0",

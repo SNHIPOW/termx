@@ -1059,11 +1059,15 @@
   // Everything is a short request that either completes or fails cleanly.
   //
   // When requests DO fail repeatedly, show it and self-heal: a reload drops
-  // every socket the page owns. ONE reload per page lifetime — a flapping
-  // link must not be able to turn this into a reload loop, which is exactly
-  // what the earlier re-arm-on-success rule produced on an unstable path.
+  // every socket the page owns — including dead ones the browser still counts
+  // against its ~6-per-origin limit, which is exactly the stuck state observed
+  // before each 'can't connect' episode. Rate-limited instead of
+  // once-per-lifetime: a link that flaps every hour needs the page to unstick
+  // itself more than once, but a fast loop would blank the screen endlessly.
+  // 10 minutes between auto-reloads, one per outage.
   let failStreak = 0;
-  let autoReloaded = false;          // sticky for this page's whole lifetime
+  let lastAutoReload = 0;
+  const AUTO_RELOAD_MIN_GAP = 10 * 60 * 1000;
   const connBanner = document.getElementById('connBanner');
 
   function noteFetchResult(ok) {
@@ -1076,10 +1080,11 @@
     failStreak++;
     if (failStreak >= 3 && connBanner) connBanner.classList.remove('hidden');
     if (failStreak >= 6) {
-      // Only reload once per page lifetime, and only after the boot grace
-      // period so a slow first load can't loop.
-      if (bootGracePassed && !autoReloaded) {
-        autoReloaded = true;
+      // After the boot grace period, and at most once per 10 minutes — enough
+      // to unstick the browser's connection pool repeatedly without looping.
+      const now = Date.now();
+      if (bootGracePassed && now - lastAutoReload > AUTO_RELOAD_MIN_GAP) {
+        lastAutoReload = now;
         location.reload();
       }
     }

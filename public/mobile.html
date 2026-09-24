@@ -657,12 +657,14 @@
   // phone on mobile data (a 1500-line default meant ~157KB/s, which stalled the
   // connection outright) and let the user pull more on demand.
   // Payload budget, not a capture budget: ~90 bytes per line, re-sent on every
-  // poll. Measured on a real phone the uplink can drop to ~8KB/s with 40%
-  // retransmits, so the first screen has to be small enough to actually arrive.
-  // More history is opt-in via the button.
+  // poll. On a lossy carrier link a large window is catastrophic — TCP
+  // retransmits the whole block on every loss, and measured connections showed
+  // GBs of retransmit churn from a few hundred KB of real content, which
+  // simply kills the link. Keep windows small; deep history belongs on the
+  // desktop, where the link is stable.
   const CAPTURE_START = 120;
-  const CAPTURE_STEP  = 400;
-  const CAPTURE_MAX   = 8000;    // ~700KB; beyond this a phone just chokes
+  const CAPTURE_STEP  = 300;
+  const CAPTURE_MAX   = 1200;    // ~100KB gzipped ~25KB; hard ceiling for mobile
   const POLL_FAST     = 1500;    // session is producing output
   const POLL_SLOW     = 10000;   // session quiet — barely any traffic
   const FETCH_TIMEOUT = 8000;

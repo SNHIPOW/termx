@@ -557,6 +557,8 @@
     updateHeader();
     outEl.innerHTML = '';
     lastText = null;
+    lastTag = null;              // ETag belongs to the previous session
+    quietTicks = 0;
     captureLines = CAPTURE_START;   // fresh history window per session
     atMaxHistory = false;
     updateMoreBtn();
@@ -661,10 +663,13 @@
   const CAPTURE_START = 120;
   const CAPTURE_STEP  = 400;
   const CAPTURE_MAX   = 8000;    // ~700KB; beyond this a phone just chokes
-  const POLL_MS       = 1500;
+  const POLL_FAST     = 1500;    // session is producing output
+  const POLL_SLOW     = 10000;   // session quiet — barely any traffic
   const FETCH_TIMEOUT = 8000;
   let captureLines = CAPTURE_START;
   let pollTimer = null, lastText = null, polling = false;
+  let lastTag = null;          // ETag from the server, sent back on the next poll
+  let quietTicks = 0;          // consecutive unchanged polls
   let atMaxHistory = false;   // server returned fewer lines than we asked for
   let loadedLines = 0;        // lines actually rendered (not what we asked for)
   let captureSeq = 0;         // guards against out-of-order responses
@@ -685,12 +690,21 @@
     try {
       const r = await fetch(
         `/m/capture/${encodeURIComponent(current)}?lines=${captureLines}`,
-        { signal: ac.signal });
+        { signal: ac.signal, headers: lastTag ? { 'If-None-Match': lastTag } : {} });
+      // 304 = server says nothing changed: the cheapest possible success.
+      if (r.status === 304) {
+        if (my !== captureSeq || current !== sessionAtStart) return;
+        noteFetchResult(true);
+        quietTicks++;
+        return;
+      }
+      const tag = r.headers.get('ETag');
       const j = await r.json();
       // Superseded by a newer request, or the user switched session: drop it.
       if (my !== captureSeq || current !== sessionAtStart) return;
       if (!j.ok || typeof j.text !== 'string') { noteFetchResult(false); return; }
       noteFetchResult(true);
+      if (tag) lastTag = tag;
 
       // Work out how much history actually exists BEFORE any early return.
       // Doing this after the "unchanged" check meant that once we'd reached the
@@ -700,8 +714,9 @@
       atMaxHistory = loadedLines < captureLines - 5;
       updateMoreBtn();
 
-      if (j.text === lastText && !opts.force) return;   // unchanged, keep DOM
+      if (j.text === lastText && !opts.force) { quietTicks++; return; }  // unchanged, keep DOM
       lastText = j.text;
+      quietTicks = 0;      // real change: go back to fast polling
 
       const nearBottom = wrapEl.scrollHeight - wrapEl.scrollTop - wrapEl.clientHeight < 60;
       // When loading older history, keep the line the user was reading in place
@@ -749,12 +764,13 @@
     }
   }
 
-  // Bigger windows mean a bigger payload on every tick, so back the poll off as
-  // history grows — on mobile data a 500KB/1.5s loop just kills the connection.
-  function pollInterval() {
-    if (captureLines <= 500) return POLL_MS;
-    if (captureLines <= 2000) return 3000;
-    return 6000;
+  // Adaptive delay: fast while the session is producing output, easing off to
+  // slow when nothing changes. Polling a quiet session hard was pure link
+  // abuse — every tick a full-window payload across a flaky carrier path.
+  function nextPollDelay() {
+    const quiet = Math.min(POLL_FAST * Math.pow(2, quietTicks), POLL_SLOW);
+    const big = captureLines > 2000 ? 2 : 1;   // bigger window, gentler pace
+    return Math.min(quiet * big, POLL_SLOW * 2);
   }
 
   function updateMoreBtn() {
@@ -767,11 +783,17 @@
 
   function startPolling() {
     stopPolling();
-    pullCapture();
-    pollTimer = setInterval(pullCapture, pollInterval());
+    pullCapture().then(scheduleNext);
+    function scheduleNext() {
+      pollTimer = setTimeout(async () => {
+        if (!current) return;
+        await pullCapture().catch(() => {});
+        if (current && pageTerm.classList.contains('active')) scheduleNext();
+      }, nextPollDelay());
+    }
   }
   function stopPolling() {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   }
 
   // ===================== view controls ====================================
@@ -985,10 +1007,11 @@
   // Everything is a short request that either completes or fails cleanly.
   //
   // When requests DO fail repeatedly, show it and self-heal: a reload drops
-  // every socket the page owns (including dead ones the browser is still
-  // counting against its ~6-connection-per-origin limit after a network
-  // switch). Capped at one auto-reload per outage.
+  // every socket the page owns. ONE reload per page lifetime — a flapping
+  // link must not be able to turn this into a reload loop, which is exactly
+  // what the earlier re-arm-on-success rule produced on an unstable path.
   let failStreak = 0;
+  let autoReloaded = false;          // sticky for this page's whole lifetime
   const connBanner = document.getElementById('connBanner');
 
   function noteFetchResult(ok) {
@@ -996,17 +1019,15 @@
       if (failStreak >= 3) toast('连接已恢复');
       failStreak = 0;
       if (connBanner) connBanner.classList.add('hidden');
-      // Outage over: re-arm the auto-reload for the next one.
-      if (bootGracePassed) { try { sessionStorage.removeItem('tm-reloaded'); } catch {} }
       return;
     }
     failStreak++;
     if (failStreak >= 3 && connBanner) connBanner.classList.remove('hidden');
     if (failStreak >= 6) {
-      // Only reload if we haven't already for this outage, and the page has
-      // been up long enough that this isn't a boot-time loop.
-      if (bootGracePassed && !sessionStorage.getItem('tm-reloaded')) {
-        try { sessionStorage.setItem('tm-reloaded', '1'); } catch {}
+      // Only reload once per page lifetime, and only after the boot grace
+      // period so a slow first load can't loop.
+      if (bootGracePassed && !autoReloaded) {
+        autoReloaded = true;
         location.reload();
       }
     }

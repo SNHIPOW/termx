@@ -313,6 +313,15 @@ app.get("/m/capture/:session", async (c) => {
     const text = await new Response(p.stdout).text();
     if ((await p.exited) !== 0) return c.json({ ok: false, error: "capture failed" }, 404);
 
+    // 304 when nothing changed. The mobile client re-polls the whole window
+    // on every tick; on a flaky link those unchanged payloads were the bulk
+    // of the traffic, and each full copy was another chance to stall. An
+    // unchanged reply now costs ~200 bytes. Session is part of the tag so two
+    // sessions with momentarily identical content can't false-match.
+    const tag = `"${Bun.hash(text).toString(16)}-${session}-${lines}"`;
+    const inm = c.req.header("if-none-match");
+    if (inm === tag) return c.body(null, 304, { ETag: tag });
+
     const body = JSON.stringify({ ok: true, text });
     // Terminal output is highly repetitive, so gzip buys roughly 10x here. That
     // matters: on a phone this link measured ~8KB/s with heavy retransmits, and
@@ -324,11 +333,16 @@ app.get("/m/capture/:session", async (c) => {
           "Content-Type": "application/json; charset=utf-8",
           "Content-Encoding": "gzip",
           "Cache-Control": "no-store",
+          "ETag": tag,
         },
       });
     }
     return new Response(body, {
-      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "ETag": tag,
+      },
     });
   } catch {
     return c.json({ ok: false, error: "capture failed" }, 500);

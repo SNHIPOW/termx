@@ -555,7 +555,9 @@
     pageList.classList.remove('active');
     pageTerm.classList.add('active');
     updateHeader();
-    outEl.innerHTML = '';
+    // Immediate feedback while the first capture crosses the wire (~1 RTT on
+    // this link); an empty pane for that long reads as "stuck".
+    outEl.innerHTML = '<span style="color:var(--fg-dim);font-size:13px">正在加载…</span>';
     lastText = null;
     lastTag = null;              // ETag belongs to the previous session
     quietTicks = 0;

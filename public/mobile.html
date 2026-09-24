@@ -673,15 +673,20 @@
   let lastTag = null;          // ETag from the server, sent back on the next watch
   let atMaxHistory = false;   // server returned fewer lines than we asked for
   let loadedLines = 0;        // lines actually rendered (not what we asked for)
-  let captureSeq = 0;         // guards against out-of-order responses
+  let captureSeq = 0;         // watch-loop generation: bumping it stops the watch
+  let pullSeq = 0;            // one-shot pull ordering, independent of the watch loop
   let watchAbort = null;      // AbortController for the in-flight watch request
 
   // One-shot capture pull (used after a send/key press, and by loadMore).
   async function pullCapture(opts = {}) {
     if (!current) return;
     // Sequence number so a slow, superseded request can't overwrite the view
-    // that a newer one already painted.
-    const my = ++captureSeq;
+    // that a newer one already painted. NOTE: this is a SEPARATE counter from
+    // the watch loop's — sharing one meant every one-shot pull (which fires
+    // after each send/key press) invalidated the hanging watch request, whose
+    // loop then exited on `my !== captureSeq` and never restarted. The page
+    // froze exactly after sending a message until you re-entered the session.
+    const my = ++pullSeq;
     const sessionAtStart = current;
     const ac = new AbortController();
     const budget = Math.min(FETCH_TIMEOUT + captureLines * 8, 45000);
@@ -691,14 +696,14 @@
         `/m/capture/${encodeURIComponent(current)}?lines=${captureLines}`,
         { signal: ac.signal, headers: lastTag ? { 'If-None-Match': lastTag } : {} });
       if (r.status === 304) {
-        if (my !== captureSeq || current !== sessionAtStart) return;
+        if (my !== pullSeq || current !== sessionAtStart) return;
         noteFetchResult(true);
         return;
       }
       const tag = r.headers.get('ETag');
       const j = await r.json();
-      // Superseded by a newer request, or the user switched session: drop it.
-      if (my !== captureSeq || current !== sessionAtStart) return;
+      // Superseded by a newer pull, or the user switched session: drop it.
+      if (my !== pullSeq || current !== sessionAtStart) return;
       if (!j.ok || typeof j.text !== 'string') { noteFetchResult(false); return; }
       noteFetchResult(true);
       if (tag) lastTag = tag;

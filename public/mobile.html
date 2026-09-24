@@ -834,6 +834,10 @@
     const text = inputEl.value;
     if (!text.trim() || !current) return;
     sendBtn.disabled = true;
+    // Visual state while the request is in flight — on this link that's
+    // ~1s, and a dead-looking button reads as "the message went nowhere".
+    const oldLabel = sendBtn.textContent;
+    sendBtn.textContent = '…';
     try {
       const r = await fetch(`/m/send/${encodeURIComponent(current)}`, {
         method: 'POST',
@@ -843,10 +847,18 @@
       if (r.ok) {
         inputEl.value = '';
         autoGrow();
+        // Pull immediately instead of waiting for the (possibly backed-off)
+        // poll — otherwise the pane can sit unchanged for up to 30s after a
+        // successful send, which looks exactly like "no response". The extra
+        // delay lets the backend's Enter press (300ms after the text) land and
+        // the agent begin reacting, so the first pull shows the new state.
+        quietTicks = 0;
+        setTimeout(() => pullCapture({ force: true }), 800);
       } else {
         toast('发送失败');
       }
     } catch { toast('发送失败'); }
+    sendBtn.textContent = oldLabel;
     sendBtn.disabled = false;
   }
 
@@ -858,7 +870,10 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key }),
       });
-      if (!r.ok) toast('按键失败');
+      if (!r.ok) { toast('按键失败'); return; }
+      // Same as sendText: show the effect without waiting out a backed-off poll.
+      quietTicks = 0;
+      setTimeout(() => pullCapture({ force: true }), 400);
     } catch { toast('按键失败'); }
   }
 

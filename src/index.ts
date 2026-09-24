@@ -359,6 +359,19 @@ app.get("/m/capture/:session", async (c) => {
 //   - server re-captures every 300ms; on change returns 200 {text, etag}
 //   - on hold timeout (20s) returns 304 so the client re-arms immediately
 //   - aborting the fetch (session switch) cancels the hold via the signal
+// Last served capture per session+lines key, so a watch can send only what's
+// new. Terminal output is append-mostly: when the new capture contains the
+// previous one, the delta is just the tail — tens of bytes on a live session
+// instead of the whole window. A large block on a lossy link is exactly what
+// stalls (one loss = retransmit the whole block), which is why the first
+// WebSocket generation (tiny chunks) felt low-latency where full snapshots choke.
+//
+// The delta is only valid when the client PROVES it has the base: its etag
+// must equal the etag of the text we last served for that key. Otherwise we
+// send the full window — a fresh page load, a second watcher, or a client that
+// fell behind all get the full copy, never a delta applied to the wrong base.
+const lastServed = new Map<string, { text: string; tag: string }>();
+
 app.get("/m/watch/:session", async (c) => {
   const session = c.req.param("session");
   const linesParam = parseInt(c.req.query("lines") || "120", 10);
@@ -366,12 +379,41 @@ app.get("/m/watch/:session", async (c) => {
   const clientTag = c.req.query("etag") || "";
   const deadline = Date.now() + 20000;
   const signal = c.req.raw.signal;
+  const key = `${session}:${lines}`;
 
   const captureOnce = async () => {
     const p = spawn(["tmux", "capture-pane", "-p", "-e", "-J", "-t", session, "-S", `-${lines}`]);
     const text = await new Response(p.stdout).text();
     if ((await p.exited) !== 0) return null;
     return text;
+  };
+
+  // Delta computation, gated on the client actually owning the base text.
+  // Tail whitespace is normalised before comparing: tmux pads the capture to
+  // the pane's geometry, and that padding shifts as lines are appended — an
+  // untrimmed comparison fails to match even a pure append (measured: 423/440
+  // common prefix, then padding mismatch). The client trims when rendering
+  // anyway, so this is invisible to it.
+  const deltaFor = (text: string, tag: string): { append: string } | { full: string } => {
+    const prev = lastServed.get(key);
+    lastServed.set(key, { text, tag });
+    if (!prev || prev.tag !== clientTag) return { full: text };
+    const prevText = prev.text.replace(/\s+$/, "");
+    const currText = text.replace(/\s+$/, "");
+    if (prevText === currText) return { full: text };
+    // Window slid forward (old lines fell off the top) + new lines appended:
+    // the new capture contains the previous one somewhere inside it.
+    const idx = currText.indexOf(prevText);
+    if (idx >= 0) {
+      const tail = currText.slice(idx + prevText.length);
+      if (tail.length > 0) return { append: tail };
+    }
+    // No slide: lines were appended at the end only.
+    let p = 0;
+    const minLen = Math.min(prevText.length, currText.length);
+    while (p < minLen && prevText[p] === currText[p]) p++;
+    if (p === prevText.length && currText.length > prevText.length) return { append: currText.slice(p) };
+    return { full: text };
   };
 
   try {
@@ -381,7 +423,12 @@ app.get("/m/watch/:session", async (c) => {
       if (text === null) return c.json({ ok: false, error: "session gone" }, 404);
       const tag = `"${Bun.hash(text).toString(16)}-${session}-${lines}"`;
       if (tag !== clientTag) {
-        const body = JSON.stringify({ ok: true, text, etag: tag });
+        const delta = deltaFor(text, tag);
+        const body = JSON.stringify(
+          delta.append !== undefined
+            ? { ok: true, append: delta.append, etag: tag }
+            : { ok: true, text, etag: tag },
+        );
         if ((c.req.header("accept-encoding") || "").includes("gzip")) {
           return new Response(Bun.gzipSync(new TextEncoder().encode(body)), {
             headers: {
@@ -400,7 +447,7 @@ app.get("/m/watch/:session", async (c) => {
           },
         });
       }
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 150));
     }
     // Nothing changed during the hold: tell the client to keep waiting.
     return new Response(null, {

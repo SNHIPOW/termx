@@ -733,6 +733,22 @@
     }
   }
 
+  // Append an incremental delta from the watch endpoint: paint just the new
+  // chunk onto the existing DOM (cheap — no full re-render of the window) and
+  // keep lastText in sync with what the server considers the full text.
+  function appendCapture(append) {
+    if (!lastText) { return; }   // no base yet: next full render covers it
+    const nearBottom = wrapEl.scrollHeight - wrapEl.scrollTop - wrapEl.clientHeight < 60;
+    // The server's full text = lastText + append (window sliding was already
+    // factored in server-side: the delta is relative to the content the client
+    // has, trimmed to the window).
+    lastText = (lastText + append).slice(-Math.max(captureLines * 200, 20000));
+    const frag = document.createElement('div');
+    frag.innerHTML = ansiToHtml(append);
+    while (frag.firstChild) outEl.appendChild(frag.firstChild);
+    if (nearBottom) wrapEl.scrollTop = wrapEl.scrollHeight;
+  }
+
   // The watch loop: one long-poll request hanging on the server at all times.
   // The server returns the moment the pane's content changes (checked every
   // 300ms server-side), so change latency is ~300ms + half an RTT — the same
@@ -757,10 +773,19 @@
         if (r.status === 404) { noteFetchResult(false); await sleep(2000); continue; }
         const j = await r.json();
         if (my !== captureSeq || current !== sessionAtStart) return;
-        if (!j.ok || typeof j.text !== 'string') { noteFetchResult(false); await sleep(2000); continue; }
+        if (!j.ok) { noteFetchResult(false); await sleep(2000); continue; }
         noteFetchResult(true);
         if (j.etag) lastTag = j.etag;
-        renderCapture(j.text, my, sessionAtStart, {});
+        if (typeof j.append === 'string') {
+          // Incremental update: the server only sent what's new (tens of
+          // bytes instead of the whole window — small blocks survive a lossy
+          // link far better, which is what made the WS generation feel instant).
+          appendCapture(j.append);
+        } else if (typeof j.text === 'string') {
+          renderCapture(j.text, my, sessionAtStart, {});
+        } else {
+          noteFetchResult(false); await sleep(2000); continue;
+        }
         continue;      // changed content: watch again right away
       } catch {
         // Aborted (session switch / page hidden) vs real failure:

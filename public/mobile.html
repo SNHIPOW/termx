@@ -560,7 +560,6 @@
     outEl.innerHTML = '<span style="color:var(--fg-dim);font-size:13px">正在加载…</span>';
     lastText = null;
     lastTag = null;              // ETag belongs to the previous session
-    quietTicks = 0;
     captureLines = CAPTURE_START;   // fresh history window per session
     atMaxHistory = false;
     updateMoreBtn();
@@ -667,27 +666,23 @@
   const CAPTURE_START = 120;
   const CAPTURE_STEP  = 300;
   const CAPTURE_MAX   = 1200;    // ~100KB gzipped ~25KB; hard ceiling for mobile
-  const POLL_FAST     = 1500;    // session is producing output
-  const POLL_SLOW     = 10000;   // session quiet — barely any traffic
+  const POLL_FAST     = 1500;    // base retry delay after a failed watch
   const FETCH_TIMEOUT = 8000;
   let captureLines = CAPTURE_START;
-  let pollTimer = null, lastText = null, polling = false;
-  let lastTag = null;          // ETag from the server, sent back on the next poll
-  let quietTicks = 0;          // consecutive unchanged polls
+  let lastText = null;
+  let lastTag = null;          // ETag from the server, sent back on the next watch
   let atMaxHistory = false;   // server returned fewer lines than we asked for
   let loadedLines = 0;        // lines actually rendered (not what we asked for)
   let captureSeq = 0;         // guards against out-of-order responses
+  let watchAbort = null;      // AbortController for the in-flight watch request
 
+  // One-shot capture pull (used after a send/key press, and by loadMore).
   async function pullCapture(opts = {}) {
-    if (!current || (polling && !opts.force)) return;
+    if (!current) return;
     // Sequence number so a slow, superseded request can't overwrite the view
     // that a newer one already painted.
     const my = ++captureSeq;
     const sessionAtStart = current;
-    polling = true;
-    // Abort a stalled request instead of letting them pile up on a slow link.
-    // Scale the budget with the payload: a 20k-line pull is legitimately slow
-    // on mobile data and shouldn't be killed as if it were a normal tick.
     const ac = new AbortController();
     const budget = Math.min(FETCH_TIMEOUT + captureLines * 8, 45000);
     const killer = setTimeout(() => ac.abort(), budget);
@@ -695,11 +690,9 @@
       const r = await fetch(
         `/m/capture/${encodeURIComponent(current)}?lines=${captureLines}`,
         { signal: ac.signal, headers: lastTag ? { 'If-None-Match': lastTag } : {} });
-      // 304 = server says nothing changed: the cheapest possible success.
       if (r.status === 304) {
         if (my !== captureSeq || current !== sessionAtStart) return;
         noteFetchResult(true);
-        quietTicks++;
         return;
       }
       const tag = r.headers.get('ETag');
@@ -709,78 +702,94 @@
       if (!j.ok || typeof j.text !== 'string') { noteFetchResult(false); return; }
       noteFetchResult(true);
       if (tag) lastTag = tag;
-
-      // Work out how much history actually exists BEFORE any early return.
-      // Doing this after the "unchanged" check meant that once we'd reached the
-      // oldest line the flag was never set: the button stayed enabled and
-      // captureLines kept growing while the view never gained a single row.
-      loadedLines = j.text.split('\n').length;
-      atMaxHistory = loadedLines < captureLines - 5;
-      updateMoreBtn();
-
-      if (j.text === lastText && !opts.force) { quietTicks++; return; }  // unchanged, keep DOM
-      lastText = j.text;
-      quietTicks = 0;      // real change: go back to fast polling
-
-      const nearBottom = wrapEl.scrollHeight - wrapEl.scrollTop - wrapEl.clientHeight < 60;
-      // When loading older history, keep the line the user was reading in place
-      // instead of yanking the view around.
-      const prevH = wrapEl.scrollHeight, prevTop = wrapEl.scrollTop;
-
-      outEl.innerHTML = ansiToHtml(j.text.replace(/\s+$/, ''));
-
-      if (opts.keepPosition) {
-        wrapEl.scrollTop = prevTop + (wrapEl.scrollHeight - prevH);
-      } else if (nearBottom) {
-        wrapEl.scrollTop = wrapEl.scrollHeight;
-      }
+      renderCapture(j.text, my, sessionAtStart, opts);
     } catch {
-      /* transient failure (incl. timeout): the next tick retries */
       noteFetchResult(false);
     } finally {
       clearTimeout(killer);
-      // Only the newest request may release the lock, otherwise a slow straggler
-      // finishing late would unlock while a fresh request is still running.
-      if (my === captureSeq) polling = false;
     }
   }
 
+  function renderCapture(text, my, sessionAtStart, opts) {
+    // Work out how much history actually exists BEFORE any early return.
+    loadedLines = text.split('\n').length;
+    atMaxHistory = loadedLines < captureLines - 5;
+    updateMoreBtn();
+
+    if (text === lastText && !opts.force) return;   // unchanged, keep DOM
+    lastText = text;
+
+    const nearBottom = wrapEl.scrollHeight - wrapEl.scrollTop - wrapEl.clientHeight < 60;
+    // When loading older history, keep the line the user was reading in place
+    // instead of yanking the view around.
+    const prevH = wrapEl.scrollHeight, prevTop = wrapEl.scrollTop;
+
+    outEl.innerHTML = ansiToHtml(text.replace(/\s+$/, ''));
+
+    if (opts.keepPosition) {
+      wrapEl.scrollTop = prevTop + (wrapEl.scrollHeight - prevH);
+    } else if (nearBottom) {
+      wrapEl.scrollTop = wrapEl.scrollHeight;
+    }
+  }
+
+  // The watch loop: one long-poll request hanging on the server at all times.
+  // The server returns the moment the pane's content changes (checked every
+  // 300ms server-side), so change latency is ~300ms + half an RTT — the same
+  // freshness a WebSocket push would give, but it's still a plain request that
+  // fails cleanly on network switches and never leaves zombies behind.
+  async function watchLoop() {
+    const my = ++captureSeq;
+    while (current && pageTerm.classList.contains('active') && my === captureSeq) {
+      const sessionAtStart = current;
+      watchAbort = new AbortController();
+      try {
+        const q = `lines=${captureLines}` + (lastTag ? `&etag=${encodeURIComponent(lastTag)}` : '');
+        const r = await fetch(
+          `/m/watch/${encodeURIComponent(current)}?${q}`,
+          { signal: watchAbort.signal });
+        if (my !== captureSeq || current !== sessionAtStart) return;   // superseded
+        if (r.status === 304) {
+          // Hold expired with no change: re-arm immediately.
+          noteFetchResult(true);
+          continue;
+        }
+        if (r.status === 404) { noteFetchResult(false); await sleep(2000); continue; }
+        const j = await r.json();
+        if (my !== captureSeq || current !== sessionAtStart) return;
+        if (!j.ok || typeof j.text !== 'string') { noteFetchResult(false); await sleep(2000); continue; }
+        noteFetchResult(true);
+        if (j.etag) lastTag = j.etag;
+        renderCapture(j.text, my, sessionAtStart, {});
+        continue;      // changed content: watch again right away
+      } catch {
+        // Aborted (session switch / page hidden) vs real failure:
+        if (my !== captureSeq) return;
+        noteFetchResult(false);
+        // Exponential backoff while the link is bad; instant recovery on success.
+        await sleep(Math.min(POLL_FAST * Math.pow(2, failStreak), 30000));
+      }
+    }
+  }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
   // Pull an older chunk of scrollback.
-  // Runs exclusively: stop the poll loop first, otherwise an in-flight poll
-  // makes pullCapture() bail on its `polling` guard and the click does nothing
-  // (captureLines would grow while the view never refreshed).
+  // Runs exclusively: stop the watch loop first so the larger window's next
+  // response can't race this pull.
   async function loadMore() {
     if (atMaxHistory || captureLines >= CAPTURE_MAX) return;
     const btn = document.getElementById('btnMore');
     stopPolling();
     captureLines = Math.min(captureLines + CAPTURE_STEP, CAPTURE_MAX);
+    lastTag = null;              // window size is part of the tag; force a fresh one
     if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
     try {
-      // force: bypass the in-flight guard; the sequence number keeps the older
-      // request from clobbering what this one paints.
       await pullCapture({ force: true, keepPosition: true });
-      // Report what actually arrived, not what we asked for — with a short
-      // history those differ wildly and the old message was just misleading.
       toast(atMaxHistory ? `已是全部 ${loadedLines} 行` : `已加载 ${loadedLines} 行`);
     } finally {
       updateMoreBtn();
       if (current && pageTerm.classList.contains('active')) startPolling();
     }
-  }
-
-  // Adaptive delay: fast while the session is producing output, easing off to
-  // slow when nothing changes. Polling a quiet session hard was pure link
-  // abuse — every tick a full-window payload across a flaky carrier path.
-  function nextPollDelay() {
-    // Back off on BOTH quiet (nothing changing) and failure. Retrying at the
-    // fast rate while the carrier link is already degraded just piles new
-    // requests onto a congested path — measured as ~20 simultaneous phone
-    // connections with FIN litter, feeding the very fluctuation we're trying
-    // to ride out. Let the link breathe; snap back to fast once it recovers.
-    let delay = Math.max(POLL_FAST * Math.pow(2, quietTicks), POLL_FAST);
-    if (failStreak > 0) delay = Math.max(delay, POLL_FAST * Math.pow(2, failStreak + 1));
-    const big = captureLines > 2000 ? 2 : 1;   // bigger window, gentler pace
-    return Math.min(delay * big, 30000);
   }
 
   function updateMoreBtn() {
@@ -791,19 +800,14 @@
     b.disabled = done;
   }
 
+  // Kept name (call sites elsewhere) — now starts the watch loop.
   function startPolling() {
     stopPolling();
-    pullCapture().then(scheduleNext);
-    function scheduleNext() {
-      pollTimer = setTimeout(async () => {
-        if (!current) return;
-        await pullCapture().catch(() => {});
-        if (current && pageTerm.classList.contains('active')) scheduleNext();
-      }, nextPollDelay());
-    }
+    watchLoop();
   }
   function stopPolling() {
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    captureSeq++;                // invalidate any in-flight watch response
+    if (watchAbort) { try { watchAbort.abort(); } catch {} watchAbort = null; }
   }
 
   // ===================== view controls ====================================
@@ -852,7 +856,6 @@
         // successful send, which looks exactly like "no response". The extra
         // delay lets the backend's Enter press (300ms after the text) land and
         // the agent begin reacting, so the first pull shows the new state.
-        quietTicks = 0;
         setTimeout(() => pullCapture({ force: true }), 800);
       } else {
         toast('发送失败');
@@ -871,8 +874,7 @@
         body: JSON.stringify({ key }),
       });
       if (!r.ok) { toast('按键失败'); return; }
-      // Same as sendText: show the effect without waiting out a backed-off poll.
-      quietTicks = 0;
+      // Same as sendText: show the effect without waiting for the watch cycle.
       setTimeout(() => pullCapture({ force: true }), 400);
     } catch { toast('按键失败'); }
   }

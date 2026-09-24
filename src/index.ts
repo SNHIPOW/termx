@@ -349,6 +349,69 @@ app.get("/m/capture/:session", async (c) => {
   }
 });
 
+// Long-polling variant for the mobile UI. Plain polling meant every content
+// update waited out the poll interval PLUS a full RTT (2-3s felt latency on
+// this link); a WebSocket stream fixed that but left zombies behind on every
+// network switch. Long-polling gets stream-like latency (change detected
+// ~300ms after it happens, response carries the data) while staying a plain
+// request that fails cleanly and never outlives its hold time.
+//   - client passes its last known etag
+//   - server re-captures every 300ms; on change returns 200 {text, etag}
+//   - on hold timeout (20s) returns 304 so the client re-arms immediately
+//   - aborting the fetch (session switch) cancels the hold via the signal
+app.get("/m/watch/:session", async (c) => {
+  const session = c.req.param("session");
+  const linesParam = parseInt(c.req.query("lines") || "120", 10);
+  const lines = Math.min(Math.max(Number.isNaN(linesParam) ? 120 : linesParam, 20), 2000);
+  const clientTag = c.req.query("etag") || "";
+  const deadline = Date.now() + 20000;
+  const signal = c.req.raw.signal;
+
+  const captureOnce = async () => {
+    const p = spawn(["tmux", "capture-pane", "-p", "-e", "-J", "-t", session, "-S", `-${lines}`]);
+    const text = await new Response(p.stdout).text();
+    if ((await p.exited) !== 0) return null;
+    return text;
+  };
+
+  try {
+    while (Date.now() < deadline) {
+      if (signal.aborted) return new Response(null, { status: 499 });
+      const text = await captureOnce();
+      if (text === null) return c.json({ ok: false, error: "session gone" }, 404);
+      const tag = `"${Bun.hash(text).toString(16)}-${session}-${lines}"`;
+      if (tag !== clientTag) {
+        const body = JSON.stringify({ ok: true, text, etag: tag });
+        if ((c.req.header("accept-encoding") || "").includes("gzip")) {
+          return new Response(Bun.gzipSync(new TextEncoder().encode(body)), {
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Content-Encoding": "gzip",
+              "Cache-Control": "no-store",
+              "ETag": tag,
+            },
+          });
+        }
+        return new Response(body, {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store",
+            "ETag": tag,
+          },
+        });
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    // Nothing changed during the hold: tell the client to keep waiting.
+    return new Response(null, {
+      status: 304,
+      headers: { "Cache-Control": "no-store" },
+    });
+  } catch {
+    return c.json({ ok: false, error: "watch failed" }, 500);
+  }
+});
+
 // --- Shared sidebar layout (server-side) -----------------------------------
 // Groups/pins/order used to live in each browser's localStorage, which is
 // per-origin AND per-device: the phone could never see the desktop's groups.

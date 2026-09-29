@@ -574,15 +574,24 @@ const wsPtyMap = new Map<unknown, PtyHandle>();
 await sendCommand({ action: "ensureDefault", cwd: SESSION_CWD });
 
 // --- Health self-reporting ---------------------------------------------------
-// The server has shown slow degradation over hours (RSS climbing from ~90MB
-// to 440MB+, connections going stale) whose root cause isn't visible from a
-// single inspection. Log the trend every 5 minutes so the next degradation
-// leaves a data trail: memory, attached PTYs, watch state, connection count.
+// The server has shown slow degradation over hours: RSS climbing from ~90MB
+// toward 700MB while desktop WS terminals (wsPtys>0) are attached, entering a
+// plateau once they detach — so the leak rides the PTY->WS streaming path.
+// Exact line unknown; these logs make the next climb self-identifying.
+// Fields: rss (page granularity noise aside, the trend is the signal),
+// wsPtys (attached desktop terminals), watchKeys (mobile watch state),
+// bufAlloc (Bun.mallocStats if available), and per-WS queued bytes if the
+// API exposes it. Every 5 minutes.
 setInterval(() => {
   try {
     const rss = readFileSync("/proc/self/status", "utf8").match(/VmRSS:\s+(\d+)/);
+    let extra = "";
+    try {
+      const m = (Bun as any).mallocStats?.();
+      if (m) extra = ` alloc=${m.total_allocated ?? "?"}`;
+    } catch {}
     console.log(
-      `[HEALTH] rss=${rss ? rss[1] : "?"}KB wsPtys=${wsPtyMap.size} watchKeys=${lastServed.size}`,
+      `[HEALTH] rss=${rss ? rss[1] : "?"}KB wsPtys=${wsPtyMap.size} watchKeys=${lastServed.size}${extra}`,
     );
   } catch {}
 }, 5 * 60 * 1000);

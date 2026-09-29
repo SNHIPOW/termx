@@ -16,7 +16,7 @@
 # Stop:   kill $(cat /tmp/termx-watchdog.pid)
 
 PORT="${PORT:-17681}"
-MEM_LIMIT_KB="${MEM_LIMIT_KB:-700000}"
+MEM_LIMIT_KB="${MEM_LIMIT_KB:-400000}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG=/tmp/termx-watchdog.log
 PIDFILE=/tmp/termx-watchdog.pid

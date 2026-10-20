@@ -1265,6 +1265,15 @@
         sessions = await res.json();
         sessions.forEach(s => {
           if (s.status) sessionStatusFallback[s.name] = s.status;
+          // The server is the source of truth. SSE used to be the ONLY path that
+          // updated statusMap, so a silently-dead stream froze every dot at
+          // whatever it last said (agents finished, dots stayed green). Adopt
+          // the server's status whenever it's newer than what we hold.
+          const cur = statusMap[s.name];
+          const srvAt = s.statusUpdatedAt || 0;
+          if (s.status && (!cur || (srvAt && srvAt > (cur.updatedAt || 0)) || (srvAt === 0 && cur.status !== s.status))) {
+            statusMap[s.name] = { status: s.status, message: s.statusMessage || '', updatedAt: srvAt };
+          }
         });
       } catch {
         sessions = [];
@@ -1787,11 +1796,17 @@
     }
 
     let gotSnapshot = false;
+    let currentES = null, lastEventAt = 0;
     function connectEvents() {
+      if (currentES) { try { currentES.close(); } catch {} }
       const es = new EventSource('/events');
+      currentES = es;
+      lastEventAt = Date.now();
       es.onmessage = (e) => {
+        lastEventAt = Date.now();
         let data;
         try { data = JSON.parse(e.data); } catch { return; }
+        if (data.type === 'ping') return;   // liveness only
         if (data.type === 'snapshot') {
           Object.entries(data.statuses || {}).forEach(([name, info]) => { statusMap[name] = info; });
           // On the FIRST snapshot after page load, treat every already-'done'
@@ -1838,6 +1853,20 @@
       };
       es.onerror = () => { /* EventSource auto-reconnects */ };
     }
+    // Dead-stream detection. EventSource only reconnects when it SEES an error;
+    // a stream through a relay can go silent without one (server restarted by
+    // the watchdog, relay kept the old socket), leaving every dot frozen. The
+    // server sends a data ping every 15s — 45s of silence means it's dead.
+    setInterval(() => {
+      if (document.visibilityState === 'visible' && Date.now() - lastEventAt > 45000) {
+        connectEvents();
+      }
+    }, 15000);
+    // Independent of SSE: re-sync statuses from /sessions every 10s, so even a
+    // stream that dies undetected can't leave a status stale for long.
+    setInterval(() => {
+      if (document.visibilityState === 'visible') refreshSessions(0).catch(() => {});
+    }, 10000);
 
     // --- Sidebar resize ---
     (function initSidebarResize() {

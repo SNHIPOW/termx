@@ -83,7 +83,7 @@ app.get("/sessions", async (c) => {
   const sessions = await sendCommand({ action: "list" });
   const withStatus = sessions.map((s) => {
     const st = getStatus(s.name);
-    return { ...s, status: st?.status ?? "idle", statusMessage: st?.message ?? "" };
+    return { ...s, status: st?.status ?? "idle", statusMessage: st?.message ?? "", statusUpdatedAt: st?.updatedAt ?? 0 };
   });
   return c.json(withStatus);
 });
@@ -555,7 +555,7 @@ app.get("/events", (c) => {
       // Initial full snapshot.
       send(`data: ${JSON.stringify({ type: "snapshot", statuses: getAllStatus() })}\n\n`);
       const unsub = subscribe(send);
-      const ping = setInterval(() => send(`: ping\n\n`), 15000);
+      const ping = setInterval(() => send(`data: {"type":"ping"}\n\n`), 15000);
       c.req.raw.signal.addEventListener("abort", cleanup);
     },
   });

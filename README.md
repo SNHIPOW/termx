@@ -190,6 +190,7 @@ works until you wire the hooks into your `settings.json`.
        "SessionStart":     [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh idle",    "timeout": 10 }] }],
        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh running", "timeout": 10 }] }],
        "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh running", "timeout": 10 }] }],
+       "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh running", "timeout": 10 }] }],
        "Notification":     [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",    "timeout": 10 }] }],
        "PermissionRequest":[{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh waiting", "timeout": 10 }] }],
        "Stop":             [{ "hooks": [{ "type": "command", "command": "TERMX_PORT=7681 bash /ABS/PATH/TO/report-status.sh done",    "timeout": 10 }] }],
@@ -217,6 +218,7 @@ label from the payload:
 | Event | Status |
 |-------|--------|
 | `UserPromptSubmit` | `running` |
+| `PreToolUse` | `running` — closes the gap where a long-running tool executes with the dot stuck on `waiting` (permission was granted, but nothing reported the transition until the tool finished) |
 | `PostToolUse` | `running`, or `error` when the payload has `success:false` |
 | `Notification` | `waiting` for `permission_prompt`, `done` for `idle_prompt` |
 | `PermissionRequest` / `PermissionDenied` | `waiting` |

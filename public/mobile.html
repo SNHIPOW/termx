@@ -243,6 +243,7 @@
     <section id="pageList" class="page active">
       <header>
         <span class="title grow">termx</span>
+        <button class="icon" onclick="newSession()" title="新建会话">＋</button>
         <button class="icon" onclick="refreshAll()" title="刷新">⟳</button>
       </header>
       <div id="list"></div>
@@ -931,6 +932,43 @@
     sendBtn.disabled = false;
   }
 
+  // Rename the current session (key bar '改名'). PATCH also moves the status
+  // entry server-side, so the dot survives the rename.
+  async function renameSession() {
+    if (!current) return;
+    const newName = (prompt('重命名会话', current) || '').trim();
+    if (!newName || newName === current) return;
+    try {
+      const r = await fetch(`/sessions/${encodeURIComponent(current)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName }),
+      });
+      if (!r.ok) { toast('重命名失败'); return; }
+      toast('已重命名');
+      goList();               // back to the list; the old name no longer exists
+      await refreshAll();
+    } catch { toast('重命名失败'); }
+  }
+
+  // Create a new tmux session from the list page header '+'. Empty name falls
+  // back to a server-side generated one.
+  async function newSession() {
+    const name = (prompt('新会话名称（留空自动生成）', '') || '').trim();
+    try {
+      const r = await fetch('/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(name ? { name } : {}),
+      });
+      const j = await r.json();
+      if (!r.ok) { toast('创建失败: ' + (j.error || '')); return; }
+      toast('已创建 ' + j.name);
+      await refreshAll();
+      openSession(j.name);    // jump straight into it
+    } catch { toast('创建失败'); }
+  }
+
   async function sendKey(key) {
     if (!current) return;
     try {
@@ -959,6 +997,7 @@
     { label: '⋯',     more: true },
   ];
   const MORE_KEYS = [
+    { label: '改名', action: 'rename' },
     { label: 'Tab',  key: 'Tab' },
     { label: 'y',    key: 'y' },
     { label: 'n',    key: 'n' },
@@ -989,6 +1028,8 @@
           b.textContent = more.classList.contains('open') ? '×' : '⋯';
           keepBottom();
         };
+      } else if (spec.action === 'rename') {
+        b.onclick = () => { renameSession(); };
       } else {
         b.onclick = () => {
           if (ctrlArmed && /^[a-z]$/.test(spec.key)) {

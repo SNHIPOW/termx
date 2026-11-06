@@ -108,8 +108,23 @@ export async function sendCommand<T extends Command>(cmd: T): Promise<CommandRes
     //     same frame as the text gets swallowed — the message would just sit
     //     there unsent.
     // Args are passed as an array (no shell), so ';' and quotes need no escaping.
+    // A pane stuck in copy-mode swallows keystrokes as copy commands — the
+    // agent never receives the message (hit on mobile: PgUp-style keys and
+    // TUI interactions can leave a pane in copy-mode). Cancel it before
+    // typing so delivery always lands.
+    async function ensureNotInCopyMode(session: string): Promise<void> {
+      try {
+        const p = spawn(["tmux", "list-panes", "-t", session, "-F", "#{pane_in_mode}"]);
+        const out = await new Response(p.stdout).text();
+        if ((await p.exited) === 0 && out.trim().startsWith("1")) {
+          await tmux("send-keys", "-t", session, "-X", "cancel");
+        }
+      } catch {}
+    }
+
     case "sendText": {
       if (!(await sessionExists(cmd.session))) return false as CommandResult<T>;
+      await ensureNotInCopyMode(cmd.session);
       const typed = await tmux("send-keys", "-t", cmd.session, "-l", "--", cmd.text);
       if (!typed.ok) return false as CommandResult<T>;
       await new Promise((r) => setTimeout(r, 300));
@@ -121,6 +136,7 @@ export async function sendCommand<T extends Command>(cmd: T): Promise<CommandRes
     // (no -l) so tmux resolves it; the caller is responsible for whitelisting.
     case "sendKey": {
       if (!(await sessionExists(cmd.session))) return false as CommandResult<T>;
+      await ensureNotInCopyMode(cmd.session);
       const { ok } = await tmux("send-keys", "-t", cmd.session, cmd.key);
       return ok as CommandResult<T>;
     }

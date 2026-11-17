@@ -54,9 +54,18 @@ case "$EVENT" in
     # loose "permission" match — the payload also carries a "permission_mode" field
     # that would otherwise make EVERY notification look like a permission request
     # (that bug made finished tasks blink yellow).
+    # Claude Code emits neither field; its Notification payload carries a human
+    # "message" string instead — match those phrasings so Claude Code sessions
+    # get the same yellow/white semantics. Plain substring match: the first
+    # attempt used a structured regex that couldn't get past the JSON quotes
+    # and matched nothing (verified by test).
     if printf '%s' "$PAYLOAD" | grep -q 'permission_prompt'; then
       STATUS="waiting"
     elif printf '%s' "$PAYLOAD" | grep -q 'idle_prompt'; then
+      STATUS="done"
+    elif printf '%s' "$PAYLOAD" | grep -qE 'needs your permission|permission to use'; then
+      STATUS="waiting"
+    elif printf '%s' "$PAYLOAD" | grep -qE 'waiting for your input|is waiting for'; then
       STATUS="done"
     fi
     ;;

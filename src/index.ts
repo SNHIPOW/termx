@@ -8,7 +8,6 @@ import { cors } from "hono/cors";
 import { parseArgs } from "util";
 import { spawn } from "bun";
 import { sendCommand, type PtyHandle } from "./pty";
-import { createMouseStripper } from "./mouse-filter";
 import {
   setStatus,
   getStatus,
@@ -641,14 +640,9 @@ const server = Bun.serve<WsData>({
 
       wsPtyMap.set(ws, pty);
 
-      // Strip mouse-reporting enables from the stream: Claude Code turns them
-      // on, which converts drag-to-select into app mouse events and breaks
-      // text selection in the desktop view. CodeBuddy never enables them —
-      // this makes every CLI behave like that.
-      const mouseStripper = createMouseStripper();
       pty.onData((data) => {
         if (ws.readyState === 1) {
-          ws.send(mouseStripper.push(data));
+          ws.send(data);
         }
       });
 

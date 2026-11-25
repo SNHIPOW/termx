@@ -998,6 +998,7 @@
   ];
   const MORE_KEYS = [
     { label: '改名', action: 'rename' },
+    { label: '续跑', action: 'continue' },
     { label: 'Tab',  key: 'Tab' },
     { label: 'y',    key: 'y' },
     { label: 'n',    key: 'n' },
@@ -1030,6 +1031,22 @@
         };
       } else if (spec.action === 'rename') {
         b.onclick = () => { renameSession(); };
+      } else if (spec.action === 'continue') {
+        // One-tap "continue": sends the standard resume prompt to the current
+        // session without typing it out on a phone keyboard.
+        b.onclick = async () => {
+          if (!current) return;
+          try {
+            const r = await fetch(`/m/send/${encodeURIComponent(current)}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: 'Please continue with the work you haven\'t finished yet. ' }),
+            });
+            if (!r.ok) { toast('发送失败'); return; }
+            toast('已发送:续跑');
+            setTimeout(() => pullCapture({ force: true }), 800);
+          } catch { toast('发送失败'); }
+        };
       } else {
         b.onclick = () => {
           if (ctrlArmed && /^[a-z]$/.test(spec.key)) {

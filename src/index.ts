@@ -584,17 +584,24 @@ await sendCommand({ action: "ensureDefault", cwd: SESSION_CWD });
 // API exposes it. Every 5 minutes.
 setInterval(() => {
   try {
+    // Forced GC each minute. The PTY->WS forwarding allocates heavily while
+    // agents stream; Bun's GC lets the heap climb to a ~600-700MB steady
+    // state before major collections. That looks like a leak, and a watchdog
+    // threshold set BELOW the steady state restarts the server every few
+    // minutes (the user sees the desktop terminal endlessly reconnecting).
+    // Forcing full GC keeps the working set low; the threshold is now a
+    // safety valve, not a routine.
+    try { (Bun as any).gc?.(true); } catch {}
     const rss = readFileSync("/proc/self/status", "utf8").match(/VmRSS:\s+(\d+)/);
-    let extra = "";
-    try {
-      const m = (Bun as any).mallocStats?.();
-      if (m) extra = ` alloc=${m.total_allocated ?? "?"}`;
-    } catch {}
+    let backlog = 0;
+    for (const ws of wsPtyMap.keys()) {
+      try { backlog += ws.getBufferedAmount?.() ?? 0; } catch {}
+    }
     console.log(
-      `[HEALTH] rss=${rss ? rss[1] : "?"}KB wsPtys=${wsPtyMap.size} watchKeys=${lastServed.size}${extra}`,
+      `[HEALTH] rss=${rss ? rss[1] : "?"}KB wsPtys=${wsPtyMap.size} wsBacklog=${backlog}B watchKeys=${lastServed.size}`,
     );
   } catch {}
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 const server = Bun.serve<WsData>({
   port: PORT,
@@ -640,10 +647,28 @@ const server = Bun.serve<WsData>({
 
       wsPtyMap.set(ws, pty);
 
+      // Backpressure guard. `ws.send` buffers data in memory until the client
+      // drains it; a slow relay (measured ~600Kbps) watching an agent that
+      // streams megabytes per second backs the queue up without limit — that
+      // retention was the "memory leak" (measured 2.5MB/s RSS growth; the
+      // watchdog was restarting the server every ~5 minutes, which the user
+      // saw as the desktop terminal endlessly reconnecting). Beyond 8MB of
+      // backlog, reset the connection: the page reconnects immediately and
+      // redraws the pane fresh — a second of disruption instead of an
+      // ever-growing queue.
+      const BACKLOG_LIMIT = 8 * 1024 * 1024;
       pty.onData((data) => {
-        if (ws.readyState === 1) {
-          ws.send(data);
-        }
+        if (ws.readyState !== 1) return;
+        try {
+          if (ws.getBufferedAmount() > BACKLOG_LIMIT) {
+            console.log(
+              `[WS] backpressure reset session=${session} backlog=${ws.getBufferedAmount()}B`,
+            );
+            ws.close(1013, "slow consumer");
+            return;
+          }
+        } catch {}
+        ws.send(data);
       });
 
       pty.onExit((code) => {

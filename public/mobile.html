@@ -1077,7 +1077,9 @@
   // the arrow keys + Enter in the key bar.
   const SLASH = [
     { group: '会话管理', items: [
-      { cmd: '/clear',    desc: '开启全新对话（旧对话可 /resume 找回）' },
+      // No /clear here on purpose: one thumb-tap on a phone must not be able
+      // to wipe a conversation. It's still available typed out in full for
+      // anyone who really means it.
       { cmd: '/compact',  desc: '压缩上下文，腾出空间' },
       { cmd: '/context',  desc: '查看上下文 token 分布' },
       { cmd: '/todos',    desc: '显示当前待办清单' },
